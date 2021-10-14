@@ -30,7 +30,8 @@ cd oscam-svn
 mkdir build
 cd build
 cmake ..
-make
+# Built target with list_smargo support
+make USE_PCSC=1 USE_LIBUSB=1
 make install
 
 # O Novo Oscam Compilado estara localizado em /usr/local/bin
