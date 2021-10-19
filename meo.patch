@@ -1,0 +1,3664 @@
+Index: config.sh
+--- config.sh	2019-11-09 21:23:01.657445374 +0100
++++ config.sh	2019-11-09 20:46:21.699589191 +0100
+@@ -347,7 +347,7 @@
+ 	not_have_flag USE_LIBCRYPTO && echo "CONFIG_LIB_AES=y" || echo "# CONFIG_LIB_AES=n"
+ 	enabled MODULE_CCCAM && echo "CONFIG_LIB_RC6=y" || echo "# CONFIG_LIB_RC6=n"
+ 	not_have_flag USE_LIBCRYPTO && enabled MODULE_CCCAM && echo "CONFIG_LIB_SHA1=y" || echo "# CONFIG_LIB_SHA1=n"
+-	enabled_any READER_DRE MODULE_SCAM READER_VIACCESS READER_NAGRA_MERLIN && echo "CONFIG_LIB_DES=y" || echo "# CONFIG_LIB_DES=n"
++	enabled_any READER_DRE MODULE_SCAM READER_VIACCESS READER_CONAX READER_NAGRA_MERLIN && echo "CONFIG_LIB_DES=y" || echo "# CONFIG_LIB_DES=n"
+ 	enabled_any MODULE_CCCAM READER_NAGRA READER_NAGRA_MERLIN READER_SECA && echo "CONFIG_LIB_IDEA=y" || echo "# CONFIG_LIB_IDEA=n"
+ 	not_have_flag USE_LIBCRYPTO && enabled_any READER_CONAX READER_CRYPTOWORKS READER_NAGRA READER_NAGRA_MERLIN && echo "CONFIG_LIB_BIGNUM=y" || echo "# CONFIG_LIB_BIGNUM=n"
+ 	enabled READER_NAGRA_MERLIN && echo "CONFIG_LIB_MDC2=y" || echo "# CONFIG_LIB_MDC2=n"
+Index: csctapi/icc_async.c
+--- csctapi/icc_async.c	2019-11-09 21:22:59.837457306 +0100
++++ csctapi/icc_async.c	2019-11-09 20:46:21.695589217 +0100
+@@ -54,6 +54,8 @@
+ 	mbedtls_sha256_free(&ctx_sha256);
+ 	memcpy(reader->cak7_aes_key,aes_key,32);
+ 	memcpy(reader->cak7_aes_iv,aes_iv,16);
++	char tmp[128];
++	rdr_log(reader, "Initial AES: %s", cs_hexdump(1, reader->cak7_aes_key + 16, 16, tmp, sizeof(tmp)));
+ }
+ 
+ void calculate_cak7_cmd(struct s_reader *reader, uint8_t *cmdin,uint8_t cmdlen,uint8_t *cmdout)
+@@ -74,8 +76,14 @@
+ 	// head
+ 	req[0]=0x80;
+ 	req[1]=0xCA;
+-	// len
+-	req[4]=inlen;
++	if(reader->protocol_type == ATR_PROTOCOL_TYPE_T0)
++	{
++		req[4]=inlen + 1;
++	}
++	else
++	{
++		req[4]=inlen;
++	}
+ 	req[sizeof(req)-1]=resplen;
+ 	data[4]=(reader->cak7_seq>>16)&0xFF;
+ 	data[5]=(reader->cak7_seq>>8)&0xFF;
+@@ -83,9 +91,60 @@
+ 	calculate_cak7_cmd(reader,data,inlen,&req[5]);
+ 	if(!ICC_Async_CardWrite(reader, req, sizeof(req), cta_res, p_cta_lr))
+ 	{
+-		AesCtx ctx;
+-		AesCtxIni(&ctx, reader->cak7_aes_iv, &reader->cak7_aes_key[16], KEY128, CBC);
+-		AesDecrypt(&ctx, cta_res, cta_res, *p_cta_lr-2);
++		if(reader->protocol_type == ATR_PROTOCOL_TYPE_T0)
++		{
++			if(cta_res[*p_cta_lr - 2] == 0x61)
++			{
++				uint8_t resp[] = {0x00,0xC0,0x00,0x00,0x00};
++				memcpy(resp + 4,&cta_res[*p_cta_lr - 1],1);
++				if(!ICC_Async_CardWrite(reader, resp, sizeof(resp), cta_res, p_cta_lr))
++				{
++					AesCtx ctx;
++					AesCtxIni(&ctx, reader->cak7_aes_iv, &reader->cak7_aes_key[16], KEY128, CBC);
++					AesDecrypt(&ctx, cta_res, cta_res, *p_cta_lr-2);
++				}
++				else
++				{
++					*p_cta_lr=0;
++				}
++			}
++			else if(cta_res[*p_cta_lr - 2] == 0x6F && cta_res[*p_cta_lr - 1] == 0x01)
++			{
++				rdr_log(reader, "card answered 6F01 - trying one more time");
++				if(!ICC_Async_CardWrite(reader, req, sizeof(req), cta_res, p_cta_lr))
++				{
++					if(cta_res[*p_cta_lr - 2]  == 0x61)
++					{
++						uint8_t resp[] = {0x00,0xC0,0x00,0x00,0x00};
++						memcpy(resp + 4,&cta_res[*p_cta_lr - 1],1);
++						if(!ICC_Async_CardWrite(reader, resp, sizeof(resp), cta_res, p_cta_lr))
++						{
++							AesCtx ctx;
++							AesCtxIni(&ctx, reader->cak7_aes_iv, &reader->cak7_aes_key[16], KEY128, CBC);
++							AesDecrypt(&ctx, cta_res, cta_res, *p_cta_lr-2);
++						}
++						else
++						{
++							*p_cta_lr=0;
++						}
++					}
++					else if(cta_res[*p_cta_lr - 2]  == 0x6F && cta_res[*p_cta_lr - 1] == 0x01)
++					{
++						rdr_log(reader, "card answered 6F01 - needs reinit");
++					}
++				}
++				else
++				{
++				*p_cta_lr=0;
++				}
++			}
++		}
++		else
++		{
++			AesCtx ctx;
++			AesCtxIni(&ctx, reader->cak7_aes_iv, &reader->cak7_aes_key[16], KEY128, CBC);
++			AesDecrypt(&ctx, cta_res, cta_res, *p_cta_lr-2);
++		}
+ 	}
+ 	else
+ 	{
+@@ -245,29 +304,46 @@
+ 		return ERROR;
+ 	}
+ 
++	reader->cak7type = 0;
+ #ifdef READER_NAGRA_MERLIN
+-	bool need_nagra_layer_switch = false;
+-	bool is_cak7 = false;
+-
+-	static const uint8_t hd03atr [] = {0x3F,0xFF,0x95,0x00,0xFF,0x91,0x81,0x71,0xA0,0x47,0x00,0x44,0x4E,0x41,0x53,0x50,0x31,0x39,0x30,0x20,0x4D,0x65,0x72,0x51,0x32,0x35,0x4F}; //HD03, HD03A (CAK6.3 Mode)
+-	static const uint8_t hd03atr2[] = {0x3F,0xFF,0x95,0x00,0xFF,0x91,0x81,0x71,0xFE,0x57,0x00,0x44,0x4E,0x41,0x53,0x50,0x34,0x31,0x30,0x20,0x52,0x65,0x76,0x51,0x32,0x35,0x17}; //HD03, HD03A (CAK7 Mode)
+-	static const uint8_t hd04atr [] = {0x3F,0xFF,0x95,0x00,0xFF,0x91,0x81,0x71,0xFE,0x57,0x00,0x44,0x4E,0x41,0x53,0x50,0x34,0x32,0x30,0x20,0x52,0x65,0x76,0x53,0x36,0x30,0x17}; //HD04, HD04A, HD04B (CAK7 only)
+-	static const uint8_t hd04hatr[] = {0x3F,0xFF,0x95,0x00,0xFF,0x91,0x81,0x71,0xFE,0x57,0x00,0x44,0x4E,0x41,0x53,0x50,0x34,0x32,0x30,0x20,0x52,0x65,0x76,0x53,0x36,0x34,0x13}; //HD04H (CAK7 only)
+-	static const uint8_t hd05atr [] = {0x3F,0xFF,0x95,0x00,0xFF,0x91,0x81,0x71,0xFE,0x57,0x00,0x44,0x4E,0x41,0x53,0x50,0x34,0x35,0x30,0x20,0x52,0x65,0x76,0x57,0x36,0x30,0x14}; //HD05, HD05A (CAK7 only)
+ 
+ 	ATR_GetRaw(atr, atrarr, &atr_size);
+-	if(!memcmp(hd03atr, atrarr, atr_size)) need_nagra_layer_switch = true;
+-	if(!memcmp(hd03atr2, atrarr, atr_size) || !memcmp(hd04atr, atrarr, atr_size) || !memcmp(hd04hatr, atrarr, atr_size) || !memcmp(hd05atr, atrarr, atr_size)) is_cak7 = true;
+ 
+-	if(is_cak7)
++	if((memcmp(atrarr + 8, "DNASP40", 7) == 0) || (memcmp(atrarr + 11, "DNASP41", 7) == 0) || (memcmp(atrarr + 11, "DNASP48", 7) == 0))
+ 	{
+-		rdr_log(reader, "detected nagra merlin card in CAK7 mode");
++		rdr_log(reader, "card needs reset before init");
++		memset(atr, 0, 1);
++		call(crdr_ops->activate(reader, atr)); //try to read the atr of this layer
++		ATR_GetRaw(atr, atrarr, &atr_size);
++		rdr_log(reader,"ATR: %s", cs_hexdump(1, atrarr, atr_size, tmp, sizeof(tmp)));
++		// Parse_ATR and InitCard need to be included in lock because they change parity of serial port
++		if(crdr_ops->lock)
++		{
++		crdr_ops->lock(reader);
++		}
++		int32_t ret1 = Parse_ATR(reader, atr, deprecated);
++		if(crdr_ops->unlock)
++		{
++			crdr_ops->unlock(reader);
++		}
++		if(ret1)
++		{
++			rdr_log(reader, "ERROR: Parse_ATR returned error");
++			return ERROR;
++		}
++	}
++
++	if((memcmp(atrarr + 8, "DNASP4", 6) == 0) || (memcmp(atrarr + 11, "DNASP4", 6) == 0))
++	{
++		rdr_log(reader, "detected card in CAK7 mode");
+ 		calculate_cak7_vars(reader, atr);
++		reader->cak7type = 1;
+ 	}
+-	else if(need_nagra_layer_switch)
++	else if(((memcmp(atrarr + 7, "pp", 2) == 0 && ((atrarr[9]&0x0F) >= 10)) || (memcmp(atrarr + 11, "DNASP18", 7) == 0) || (memcmp(atrarr + 11, "DNASP19", 7) == 0) || (memcmp(atrarr + 11, "DNASP1A", 7) == 0)) && reader->cak7_mode)
+ 	{
+-		rdr_log(reader, "detected nagra merlin card in legacy mode -> try switch nagra layer to CAK7");
+-		uint8_t changerom_handshake[] = { 0x80, 0xCA, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10 };
++		rdr_log(reader, "detected card in CAK6/Seca mode -> try switch to Nagra CAK7");
++		uint8_t changerom_handshake[22];
++		memset(changerom_handshake, 0x00, 22);
+ 
+ 		calculate_changerom_cmd(reader, atr, &changerom_handshake[5]);
+ 		memset(reader->rom, 0, 15);
+@@ -275,6 +351,8 @@
+ 		memset(cta_res, 0, CTA_RES_LEN);
+ 		uint16_t cta_lr;
+ 
++		changerom_handshake[0] = 0x80;
++		changerom_handshake[1] = 0xCA;
+ 		changerom_handshake[4] = 0x11; // 0x11: length of data we will send
+ 		uint8_t cta_res1_ok = 0x61;
+ 		uint8_t cta_res2_ok = 0x10;
+@@ -287,6 +365,9 @@
+ 			cta_res2_ok = 0x00;
+ 		}
+ 
++		changerom_handshake[21] = 0x10;
++
++		reader->cak7type = 1;
+ 		if(!ICC_Async_CardWrite(reader, changerom_handshake, sizeof(changerom_handshake), cta_res, &cta_lr))
+ 		{
+ 			if(cta_res[cta_lr-2] == cta_res1_ok && cta_res[cta_lr-1] == cta_res2_ok)
+@@ -295,17 +376,31 @@
+ 				memset(atr, 0, 1);
+ 				call(crdr_ops->activate(reader, atr)); //try to read the atr of this layer
+ 				ATR_GetRaw(atr, atrarr, &atr_size);
+-				rdr_log(reader,"Nagra layer ATR: %s", cs_hexdump(1, atrarr, atr_size, tmp, sizeof(tmp)));
++				rdr_log(reader,"ATR: %s", cs_hexdump(1, atrarr, atr_size, tmp, sizeof(tmp)));
+ 				calculate_cak7_vars(reader, atr);
++				if(reader->protocol_type == ATR_PROTOCOL_TYPE_T0)
++				{
++					reader->cak7type = 3;
++				}
++				else
++				{
++					reader->cak7type = 1;
++				}
++
+ 				if(crdr_ops->lock)
+ 				{
+ 					crdr_ops->lock(reader);
+ 				}
+-				Parse_ATR(reader, atr, deprecated);
++				int32_t ret2 = Parse_ATR(reader, atr, deprecated);
+ 				if(crdr_ops->unlock)
+ 				{
+ 					crdr_ops->unlock(reader);
+ 				}
++				if(ret2)
++				{
++					rdr_log(reader, "ERROR: Parse_ATR returned error");
++					return ERROR;
++				}
+ 			}
+ 			else
+ 			{
+@@ -362,7 +457,7 @@
+ 		case ATR_PROTOCOL_TYPE_T1:
+ 			ret = Protocol_T1_Command(reader, command, command_len, rsp, lr);
+ 			type = 1;
+-			if(ret != OK && !crdr_ops->skip_t1_command_retries)
++			if(ret != OK && !crdr_ops->skip_t1_command_retries && reader->cak7type == 0)
+ 			{
+ 				//try to resync
+ 				rdr_log(reader, "Resync error: readtimeouts %d/%d (max/min) us, writetimeouts %d/%d (max/min) us", reader->maxreadtimeout, reader->minreadtimeout, reader->maxwritetimeout, reader->minwritetimeout);
+@@ -398,7 +493,7 @@
+ 		}
+ 		try++;
+ 	}
+-	while((try < 3) && (ret != OK)); // always do one retry when failing
++	while((try < 3) && (ret != OK) && (((type == 0 || type == 1) && reader->cak7type == 0) || type == 14)); // always do one retry when failing
+ 	if(crdr_ops->unlock)
+ 	{
+ 		crdr_ops->unlock(reader);
+Index: csctapi/ifd_pcsc.c
+--- csctapi/ifd_pcsc.c	2019-11-09 21:22:59.841457280 +0100
++++ csctapi/ifd_pcsc.c	2019-11-09 20:46:21.695589217 +0100
+@@ -364,7 +364,7 @@
+ {
+ 	.desc                    = "pcsc",
+ 	.typ                     = R_PCSC,
+-	.skip_extra_atr_parsing  = 1,
++	.skip_extra_atr_parsing  = 0,
+ 	.skip_t1_command_retries = 1,
+ 	.skip_setting_ifsc       = 1,
+ 	.reader_init             = pcsc_init,
+Index: csctapi/io_serial.c
+--- csctapi/io_serial.c	2019-11-09 21:22:59.837457306 +0100
++++ csctapi/io_serial.c	2019-11-09 20:46:21.695589217 +0100
+@@ -490,7 +490,10 @@
+ {
+ 	const struct s_cardreader *crdr_ops = reader->crdr;
+ 	if (!crdr_ops) return ERROR;
+-
++	if(reader->wdelay)
++	{
++		delay = reader->wdelay;
++	}
+ 	if(timeout == 0)   // General fix for readers not communicating timeout and delay
+ 	{
+ 		if(reader->char_delay != 0) { timeout = reader->char_delay; }
+Index: globals.h
+--- globals.h	2019-11-09 21:23:00.801450986 +0100
++++ globals.h	2019-11-09 20:50:35.605919623 +0100
+@@ -1475,9 +1475,11 @@
+ 	uint8_t			keepalive;
+ 	uint8_t			changes_since_shareupdate;
+ 	int32_t			resetcycle;						// ECM until reset
++	int32_t			wdelay;						// ECM until reset
+ 	int32_t			resetcounter;					// actual count
+ 	uint32_t		auprovid;						// AU only for this provid
+ 	int8_t			audisabled;						// exclude reader from auto AU
++	int8_t			autype;
+ 	int8_t			needsemmfirst;					// 0: reader descrambles without emm first, 1: reader needs emms before it can descramble
+ 	struct timeb	emm_last;							// time of last successfully written emm
+ 	int8_t			smargopatch;
+@@ -1499,18 +1501,53 @@
+ #ifdef READER_NAGRA_MERLIN
+ 	uint8_t			mod1[112];
+ 	uint8_t			mod1_length;
++	uint8_t			cmd0eprov[2];
++	uint8_t			cmd0eprov_length;
++	uint8_t			mod2[112];
++	uint8_t			mod2_length;
++	uint8_t			tmprsa[112];
+ 	uint8_t			data50[80];
+ 	uint8_t			data50_length;
+ 	uint8_t			mod50[80];
+ 	uint8_t			mod50_length;
++	uint8_t			key3588[136];
++	uint8_t			key3588_length;
+ 	uint8_t			key60[96];
+ 	uint8_t			key60_length;
+ 	uint8_t			exp60[96];
+ 	uint8_t			exp60_length;
++	uint8_t			key68[104];
++	uint8_t			key68_length;
++	uint8_t			exp68[104];
++	uint8_t			exp68_length;
++	uint8_t			key3des[16];
++	uint8_t			klucz68[24];
++	uint8_t			pairtype;
++	uint8_t			pairbyte;
++	uint8_t			key3460[96];
++	uint8_t			key3460_length;
++	uint8_t			key3310[16];
++	uint8_t			key3310_length;
+ 	uint8_t			nuid[4];
+ 	uint8_t			nuid_length;
+-	uint8_t			cwekey[16];
+-	uint8_t			cwekey_length;
++	uint8_t			cwekey0[16];
++	uint8_t			cwekey0_length;
++	uint8_t			cwekey1[16];
++	uint8_t			cwekey1_length;
++	uint8_t			cwekey2[16];
++	uint8_t			cwekey2_length;
++	uint8_t			cwekey3[16];
++	uint8_t			cwekey3_length;
++	uint8_t			cwekey4[16];
++	uint8_t			cwekey4_length;
++	uint8_t			cwekey5[16];
++	uint8_t			cwekey5_length;
++	uint8_t			cwekey6[16];
++	uint8_t			cwekey6_length;
++	uint8_t			cwekey7[16];
++	uint8_t			cwekey7_length;
++	uint8_t			idird[4];
++	uint8_t			idird_length;
+ 	uint8_t			kdt05_00[216];
+ 	uint8_t			kdt05_10[208];
+ 	uint8_t			cardid[8];
+@@ -1523,6 +1560,9 @@
+ 	uint8_t			iout[8];
+ 	uint32_t		dword_83DBC;
+ 	uint8_t			data2[4];
++	uint8_t			ecmheader[4];
++	uint8_t			timestmp1[4];
++	uint8_t			timestmp2[4];
+ 	uint8_t			cak7expo[0x11];
+ 	uint8_t			data[0x80];
+ 	uint8_t			step1[0x60];
+@@ -1536,6 +1576,10 @@
+ 	uint8_t			cak7_camstate;
+ 	uint8_t			cak7_aes_key[32];
+ 	uint8_t			cak7_aes_iv[16];
++	int8_t			forcecwswap;
++	int8_t			evensa;
++	int8_t			forceemmg;
++
+ #endif
+ #ifdef CS_CACHEEX
+ 	CECSP			cacheex;						// CacheEx Settings
+@@ -1560,6 +1604,8 @@
+ 	int32_t			l_port;
+ 	CAIDTAB			ctab;
+ 	uint32_t		boxid;
++	int8_t			cak7_mode;
++	uint8_t			cak7type;
+ 	int8_t			nagra_read;						// read nagra ncmed records: 0 Disabled (default), 1 read all records, 2 read valid records only
+ 	int8_t			detect_seca_nagra_tunneled_card;
+ 	int8_t			force_irdeto;
+@@ -1567,6 +1613,8 @@
+ 	uint8_t			boxkey_length;
+ 	uint8_t			rsa_mod[120];					// rsa modulus for nagra cards.
+ 	uint8_t			rsa_mod_length;
++	uint8_t			cwpk_mod[16];					// cwpk modulus for conax cards.
++	uint8_t			cwpk_mod_length;
+ 	uint8_t			des_key[128];					// 3des key for Viaccess 16 bytes, des key for Dre 128 bytes
+ 	uint8_t			des_key_length;
+ 	uint8_t			atr[64];
+@@ -1578,8 +1626,18 @@
+ 	SIDTABS			lb_sidtabs;
+ 	uint8_t			hexserial[8];
+ 	int32_t			nprov;
++	int32_t			nsa;
++	int32_t			nemm84;
++	int32_t			nemm83u;
++	int32_t			nemm83s;
++	int32_t			nemm87;
+ 	uint8_t			prid[CS_MAXPROV][8];
+ 	uint8_t			sa[CS_MAXPROV][4];				// viaccess & seca
++	uint8_t			emm84[CS_MAXPROV][3];
++	uint8_t			emm83u[CS_MAXPROV][6];
++	uint8_t			emm83s[CS_MAXPROV][6];
++	uint8_t			emm87[CS_MAXPROV][6];
++	uint8_t			emm82;
+ 	uint8_t			read_old_classes;				// viaccess
+ 	uint8_t			maturity;						// viaccess & seca maturity level
+ 	uint16_t		caid;
+Index: module-webif.c
+--- module-webif.c	2019-11-09 21:22:59.841457280 +0100
++++ module-webif.c	2019-11-09 20:54:16.108582329 +0100
+@@ -2250,6 +2250,8 @@
+ 	// Reset Cycle
+ 	tpl_printf(vars, TPLADD, "RESETCYCLE", "%d", rdr->resetcycle);
+ 
++	tpl_printf(vars, TPLADD, "WDELAY", "%d", rdr->wdelay);
++
+ 	// Disable Serverfilter
+ 	if(!apicall)
+ 	{
+@@ -2384,6 +2386,9 @@
+ 		tpl_addVar(vars, TPLADD, "AUDISABLEDVALUE", (rdr->audisabled == 1) ? "1" : "0");
+ 	}
+ 
++	tpl_printf(vars, TPLADD, "TMP", "AUTYPE%d", rdr->autype);
++	tpl_addVar(vars, TPLADD, tpl_getVar(vars, "TMP"), "selected");
++
+ 	// AUprovid
+ 	if(rdr->auprovid)
+ 		{ tpl_printf(vars, TPLADD, "AUPROVID", "%06X", rdr->auprovid); }
+@@ -2445,8 +2450,32 @@
+ 		for(i = 0; i < len ; i++)
+ 			{ tpl_printf(vars, TPLAPPEND, "BOXKEY", "%02X", rdr->boxkey[i]); }
+ 	}
++#ifdef READER_CONAX
++	// CWPK Key
++	len = rdr->cwpk_mod_length;
++	if(len > 0)
++	{
++		for(i = 0; i < len; i++) { tpl_printf(vars, TPLAPPEND, "CWPKKEY", "%02X", rdr->cwpk_mod[i]); }
++	}
++#endif
+ 
+ #ifdef READER_NAGRA_MERLIN
++	// idird (CAK7)
++	len = rdr->idird_length;
++	if(len > 0)
++	{
++		for(i = 0; i < len ; i++)
++			{ tpl_printf(vars, TPLAPPEND, "IDIRD", "%02X", rdr->idird[i]); }
++	}
++
++	// cmd0e_provider (CAK7)
++	len = rdr->cmd0eprov_length;
++	if(len > 0)
++	{
++		for(i = 0; i < len ; i++)
++			{ tpl_printf(vars, TPLAPPEND, "CMD0EPROV", "%02X", rdr->cmd0eprov[i]); }
++	}
++
+ 	// mod1 (CAK7)
+ 	len = rdr->mod1_length;
+ 	if(len > 0)
+@@ -2455,6 +2484,38 @@
+ 			{ tpl_printf(vars, TPLAPPEND, "MOD1", "%02X", rdr->mod1[i]); }
+ 	}
+ 
++	// mod2 (CAK7)
++	len = rdr->mod2_length;
++	if(len > 0)
++	{
++		for(i = 0; i < len ; i++)
++			{ tpl_printf(vars, TPLAPPEND, "MOD2", "%02X", rdr->mod2[i]); }
++	}
++
++	// key3588 (CAK7)
++	len = rdr->key3588_length;
++	if(len > 0)
++	{
++		for(i = 0; i < len ; i++)
++			{ tpl_printf(vars, TPLAPPEND, "KEY3588", "%02X", rdr->key3588[i]); }
++	}
++
++	// key3310 (CAK7)
++	len = rdr->key3310_length;
++	if(len > 0)
++	{
++		for(i = 0; i < len ; i++)
++		{ tpl_printf(vars, TPLAPPEND, "KEY3310", "%02X", rdr->key3310[i]); }
++	}
++
++	// key3460 (CAK7)
++	len = rdr->key3460_length;
++	if(len > 0)
++	{
++		for(i = 0; i < len ; i++)
++			{ tpl_printf(vars, TPLAPPEND, "KEY3460", "%02X", rdr->key3460[i]); }
++	}
++
+ 	// data50 (CAK7)
+ 	len = rdr->data50_length;
+ 	if(len > 0)
+@@ -2471,39 +2532,95 @@
+ 			{ tpl_printf(vars, TPLAPPEND, "MOD50", "%02X", rdr->mod50[i]); }
+ 	}
+ 
+-	// key60 (CAK7)
+-	len = rdr->key60_length;
++	// nuid (CAK7)
++	len = rdr->nuid_length;
+ 	if(len > 0)
+ 	{
+ 		for(i = 0; i < len ; i++)
+-			{ tpl_printf(vars, TPLAPPEND, "KEY60", "%02X", rdr->key60[i]); }
++			{ tpl_printf(vars, TPLAPPEND, "NUID", "%02X", rdr->nuid[i]); }
+ 	}
+ 
+-	// exp60 (CAK7)
+-	len = rdr->exp60_length;
++	// cwekey0 (CAK7)
++	len = rdr->cwekey0_length;
+ 	if(len > 0)
+ 	{
+ 		for(i = 0; i < len ; i++)
+-			{ tpl_printf(vars, TPLAPPEND, "EXP60", "%02X", rdr->exp60[i]); }
++			{ tpl_printf(vars, TPLAPPEND, "CWEKEY0", "%02X", rdr->cwekey0[i]); }
+ 	}
+ 
+-	// nuid (CAK7)
+-	len = rdr->nuid_length;
++	// cwekey1 (CAK7)
++	len = rdr->cwekey1_length;
+ 	if(len > 0)
+ 	{
+ 		for(i = 0; i < len ; i++)
+-			{ tpl_printf(vars, TPLAPPEND, "NUID", "%02X", rdr->nuid[i]); }
++			{ tpl_printf(vars, TPLAPPEND, "CWEKEY1", "%02X", rdr->cwekey1[i]); }
++	}
++
++	// cwekey2 (CAK7)
++	len = rdr->cwekey2_length;
++	if(len > 0)
++	{
++		for(i = 0; i < len ; i++)
++			{ tpl_printf(vars, TPLAPPEND, "CWEKEY2", "%02X", rdr->cwekey2[i]); }
++	}
++
++	// cwekey3 (CAK7)
++	len = rdr->cwekey3_length;
++	if(len > 0)
++	{
++		for(i = 0; i < len ; i++)
++			{ tpl_printf(vars, TPLAPPEND, "CWEKEY3", "%02X", rdr->cwekey3[i]); }
++	}
++
++	// cwekey4 (CAK7)
++	len = rdr->cwekey4_length;
++	if(len > 0)
++	{
++		for(i = 0; i < len ; i++)
++			{ tpl_printf(vars, TPLAPPEND, "CWEKEY4", "%02X", rdr->cwekey4[i]); }
++	}
++
++	// cwekey5 (CAK7)
++	len = rdr->cwekey5_length;
++	if(len > 0)
++	{
++		for(i = 0; i < len ; i++)
++			{ tpl_printf(vars, TPLAPPEND, "CWEKEY5", "%02X", rdr->cwekey5[i]); }
++	}
++
++	// cwekey6 (CAK7)
++	len = rdr->cwekey6_length;
++	if(len > 0)
++	{
++		for(i = 0; i < len ; i++)
++			{ tpl_printf(vars, TPLAPPEND, "CWEKEY6", "%02X", rdr->cwekey6[i]); }
+ 	}
+ 
+-	// cwekey (CAK7)
+-	len = rdr->cwekey_length;
++	// cwekey7 (CAK7)
++	len = rdr->cwekey7_length;
+ 	if(len > 0)
+ 	{
+ 		for(i = 0; i < len ; i++)
+-			{ tpl_printf(vars, TPLAPPEND, "CWEKEY", "%02X", rdr->cwekey[i]); }
++			{ tpl_printf(vars, TPLAPPEND, "CWEKEY7", "%02X", rdr->cwekey7[i]); }
+ 	}
++
++	// force_cw_swap
++	if(rdr->forcecwswap)
++		{ tpl_addVar(vars, TPLADD, "FORCECWSWAPCHECKED", "checked"); }
++
++	// only_even_SA
++	if(rdr->evensa)
++		{ tpl_addVar(vars, TPLADD, "EVENSACHECKED", "checked"); }
++
++	// force_EMM_82
++	if(rdr->forceemmg)
++		{ tpl_addVar(vars, TPLADD, "FORCEEMMGCHECKED", "checked"); }
+ #endif
+ 
++	// cak7_mode
++	if(rdr->cak7_mode)
++		{ tpl_addVar(vars, TPLADD, "NAGRACAK7MODECHECKED", "checked"); }
++
+ 	// ins7E
+ 	if(rdr->ins7E[0x1A])
+ 	{
+Index: oscam-config-reader.c
+--- oscam-config-reader.c	2019-11-09 21:23:00.801450986 +0100
++++ oscam-config-reader.c	2019-11-09 20:59:17.782692596 +0100
+@@ -227,6 +227,43 @@
+ 		{ fprintf_conf(f, token, "\n"); }
+ }
+ 
++static void cwpkkey_fn(const char *token, char *value, void *setting, FILE *f)
++{
++	struct s_reader *rdr = setting;
++	if(value)
++	{
++		int32_t len = strlen(value);
++	//	rdr_log(rdr, "CWPK config key length: %16X", len);
++		if(len == 0 || len > 32)
++		{
++			rdr->cwpk_mod_length = 0;
++			memset(rdr->cwpk_mod, 0, sizeof(rdr->cwpk_mod));
++		}
++		else
++		{
++			if(key_atob_l(value, rdr->cwpk_mod, len))
++			{
++				fprintf(stderr, "reader cwpkkey parse error, %s=%s\n", token, value);
++				rdr->cwpk_mod_length = 0;
++				memset(rdr->cwpk_mod, 0, sizeof(rdr->cwpk_mod));
++			}
++			else
++			{
++				rdr->cwpk_mod_length = len/2;
++			}
++		}
++		return;
++	}
++	int32_t len = rdr->cwpk_mod_length;
++	if(len > 0)
++	{
++		char tmp[len * 2 + 1];
++		fprintf_conf(f, "cwpkkey", "%s\n", cs_hexdump(0, rdr->cwpk_mod, len, tmp, sizeof(tmp)));
++	}
++	else if(cfg.http_full_cfg)
++		{ fprintf_conf(f, "cwpkkey", "\n"); }
++}
++
+ static void rsakey_fn(const char *token, char *value, void *setting, FILE *f)
+ {
+ 	struct s_reader *rdr = setting;
+@@ -372,6 +409,150 @@
+ 		{ fprintf_conf(f, "mod1", "\n"); }
+ }
+ 
++static void mod2_fn(const char *token, char *value, void *setting, FILE *f)
++{
++	struct s_reader *rdr = setting;
++	if(value)
++	{
++		int32_t len = strlen(value);
++		if(len != 224)
++		{
++			rdr->mod2_length = 0;
++			memset(rdr->mod2, 0, 112);
++		}
++		else
++		{
++			if(key_atob_l(value, rdr->mod2, len))
++			{
++				fprintf(stderr, "reader mod2 parse error, %s=%s\n", token, value);
++				rdr->mod2_length = 0;
++				memset(rdr->mod2, 0, sizeof(rdr->mod2));
++			}
++			else
++			{
++				rdr->mod2_length = len/2;
++			}
++		}
++	return;
++	}
++	int32_t len = rdr->mod2_length;
++	if(len > 0)
++	{
++		char tmp[len * 2 + 1];
++		fprintf_conf(f, "mod2", "%s\n", cs_hexdump(0, rdr->mod2, len, tmp, sizeof(tmp)));
++	}
++	else if(cfg.http_full_cfg)
++		{ fprintf_conf(f, "mod2", "\n"); }
++}
++
++static void idird_fn(const char *token, char *value, void *setting, FILE *f)
++{
++	struct s_reader *rdr = setting;
++	if(value)
++	{
++		int32_t len = strlen(value);
++		if(len != 8)
++		{
++			rdr->idird_length = 0;
++			memset(rdr->idird, 0, 4);
++		}
++		else
++		{
++			if(key_atob_l(value, rdr->idird, len))
++			{
++				fprintf(stderr, "reader idird parse error, %s=%s\n", token, value);
++				rdr->idird_length = 0;
++				memset(rdr->idird, 0, sizeof(rdr->idird));
++			}
++			else
++			{
++				rdr->idird_length = len/2;
++			}
++		}
++		return;
++	}
++	int32_t len = rdr->idird_length;
++	if(len > 0)
++	{
++		char tmp[len * 2 + 1];
++		fprintf_conf(f, "idird", "%s\n", cs_hexdump(0, rdr->idird, len, tmp, sizeof(tmp)));
++	}
++	else if(cfg.http_full_cfg)
++		{ fprintf_conf(f, "idird", "\n"); }
++}
++
++static void cmd0eprov_fn(const char *token, char *value, void *setting, FILE *f)
++{
++	struct s_reader *rdr = setting;
++	if(value)
++	{
++		int32_t len = strlen(value);
++		if(len != 4)
++		{
++			rdr->cmd0eprov_length = 0;
++			memset(rdr->cmd0eprov, 0, 2);
++		}
++		else
++		{
++			if(key_atob_l(value, rdr->cmd0eprov, len))
++			{
++				fprintf(stderr, "reader cmd0eprov parse error, %s=%s\n", token, value);
++				rdr->cmd0eprov_length = 0;
++				memset(rdr->cmd0eprov, 0, sizeof(rdr->cmd0eprov));
++			}
++			else
++			{
++				rdr->cmd0eprov_length = len/2;
++			}
++		}
++		return;
++	}
++	int32_t len = rdr->cmd0eprov_length;
++	if(len > 0)
++	{
++		char tmp[len * 2 + 1];
++		fprintf_conf(f, "cmd0eprov", "%s\n", cs_hexdump(0, rdr->cmd0eprov, len, tmp, sizeof(tmp)));
++	}
++	else if(cfg.http_full_cfg)
++		{ fprintf_conf(f, "cmd0eprov", "\n"); }
++}
++
++static void key3588_fn(const char *token, char *value, void *setting, FILE *f)
++{
++	struct s_reader *rdr = setting;
++	if(value)
++	{
++		int32_t len = strlen(value);
++		if(len != 272)
++		{
++			rdr->key3588_length = 0;
++			memset(rdr->key3588, 0, 136);
++		}
++		else
++		{
++			if(key_atob_l(value, rdr->key3588, len))
++			{
++				fprintf(stderr, "reader key3588 parse error, %s=%s\n", token, value);
++				rdr->key3588_length = 0;
++				memset(rdr->key3588, 0, sizeof(rdr->key3588));
++			}
++			else
++			{
++				rdr->key3588_length = len/2;
++			}
++		}
++		return;
++	}
++	int32_t len = rdr->key3588_length;
++	if(len > 0)
++	{
++		char tmp[len * 2 + 1];
++		fprintf_conf(f, "key3588", "%s\n", cs_hexdump(0, rdr->key3588, len, tmp, sizeof(tmp)));
++	}
++	else if(cfg.http_full_cfg)
++		{ fprintf_conf(f, "key3588", "\n"); }
++}
++
+ static void data50_fn(const char *token, char *value, void *setting, FILE *f)
+ {
+ 	struct s_reader *rdr = setting;
+@@ -444,7 +625,7 @@
+ 		{ fprintf_conf(f, "mod50", "\n"); }
+ }
+ 
+-static void key60_fn(const char *token, char *value, void *setting, FILE *f)
++static void key3460_fn(const char *token, char *value, void *setting, FILE *f)
+ {
+ 	struct s_reader *rdr = setting;
+ 	if(value)
+@@ -452,68 +633,68 @@
+ 		int32_t len = strlen(value);
+ 		if(len != 192)
+ 		{
+-			rdr->key60_length = 0;
+-			memset(rdr->key60, 0, 96);
++			rdr->key3460_length = 0;
++			memset(rdr->key3460, 0, 96);
+ 		}
+ 		else
+ 		{
+-			if(key_atob_l(value, rdr->key60, len))
++			if(key_atob_l(value, rdr->key3460, len))
+ 			{
+-				fprintf(stderr, "reader key60 parse error, %s=%s\n", token, value);
+-				rdr->key60_length = 0;
+-				memset(rdr->key60, 0, sizeof(rdr->key60));
++				fprintf(stderr, "reader key3460 parse error, %s=%s\n", token, value);
++				rdr->key3460_length = 0;
++				memset(rdr->key3460, 0, sizeof(rdr->key3460));
+ 			}
+ 			else
+ 			{
+-				rdr->key60_length = len/2;
++				rdr->key3460_length = len/2;
+ 			}
+ 		}
+ 		return;
+ 	}
+-	int32_t len = rdr->key60_length;
++	int32_t len = rdr->key3460_length;
+ 	if(len > 0)
+ 	{
+ 		char tmp[len * 2 + 1];
+-		fprintf_conf(f, "key60", "%s\n", cs_hexdump(0, rdr->key60, len, tmp, sizeof(tmp)));
++		fprintf_conf(f, "key3460", "%s\n", cs_hexdump(0, rdr->key3460, len, tmp, sizeof(tmp)));
+ 	}
+ 	else if(cfg.http_full_cfg)
+-		{ fprintf_conf(f, "key60", "\n"); }
++		{ fprintf_conf(f, "key3460", "\n"); }
+ }
+ 
+-static void exp60_fn(const char *token, char *value, void *setting, FILE *f)
++static void key3310_fn(const char *token, char *value, void *setting, FILE *f)
+ {
+ 	struct s_reader *rdr = setting;
+ 	if(value)
+ 	{
+ 		int32_t len = strlen(value);
+-		if(len != 192)
++		if(len != 32)
+ 		{
+-			rdr->exp60_length = 0;
+-			memset(rdr->exp60, 0, 96);
++			rdr->key3310_length = 0;
++			memset(rdr->key3310, 0, 16);
+ 		}
+ 		else
+ 		{
+-			if(key_atob_l(value, rdr->exp60, len))
++			if(key_atob_l(value, rdr->key3310, len))
+ 			{
+-				fprintf(stderr, "reader exp60 parse error, %s=%s\n", token, value);
+-				rdr->exp60_length = 0;
+-				memset(rdr->exp60, 0, sizeof(rdr->exp60));
++				fprintf(stderr, "reader key3310 parse error, %s=%s\n", token, value);
++				rdr->key3310_length = 0;
++				memset(rdr->key3310, 0, sizeof(rdr->key3310));
+ 			}
+ 			else
+ 			{
+-				rdr->exp60_length = len/2;
++				rdr->key3310_length = len/2;
+ 			}
+ 		}
+ 		return;
+ 	}
+-	int32_t len = rdr->exp60_length;
++	int32_t len = rdr->key3310_length;
+ 	if(len > 0)
+ 	{
+ 		char tmp[len * 2 + 1];
+-		fprintf_conf(f, "exp60", "%s\n", cs_hexdump(0, rdr->exp60, len, tmp, sizeof(tmp)));
++		fprintf_conf(f, "key3310", "%s\n", cs_hexdump(0, rdr->key3310, len, tmp, sizeof(tmp)));
+ 	}
+ 	else if(cfg.http_full_cfg)
+-		{ fprintf_conf(f, "exp60", "\n"); }
++		{ fprintf_conf(f, "key3310", "\n"); }
+ }
+ 
+ static void nuid_fn(const char *token, char *value, void *setting, FILE *f)
+@@ -552,7 +733,187 @@
+ 		{ fprintf_conf(f, "nuid", "\n"); }
+ }
+ 
+-static void cwekey_fn(const char *token, char *value, void *setting, FILE *f)
++static void cwekey0_fn(const char *token, char *value, void *setting, FILE *f)
++{
++	struct s_reader *rdr = setting;
++	if(value)
++	{
++		int32_t len = strlen(value);
++		if(len != 32)
++		{
++			rdr->cwekey0_length = 0;
++			memset(rdr->cwekey0, 0, 16);
++		}
++		else
++		{
++			if(key_atob_l(value, rdr->cwekey0, len))
++			{
++				fprintf(stderr, "reader cwekey0 parse error, %s=%s\n", token, value);
++				rdr->cwekey0_length = 0;
++				memset(rdr->cwekey0, 0, sizeof(rdr->cwekey0));
++			}
++			else
++			{
++				rdr->cwekey0_length = len/2;
++			}
++		}
++		return;
++	}
++	int32_t len = rdr->cwekey0_length;
++	if(len > 0)
++	{
++		char tmp[len * 2 + 1];
++		fprintf_conf(f, "cwekey0", "%s\n", cs_hexdump(0, rdr->cwekey0, len, tmp, sizeof(tmp)));
++	}
++	else if(cfg.http_full_cfg)
++		{ fprintf_conf(f, "cwekey0", "\n"); }
++}
++
++static void cwekey1_fn(const char *token, char *value, void *setting, FILE *f)
++{
++	struct s_reader *rdr = setting;
++	if(value)
++	{
++		int32_t len = strlen(value);
++		if(len != 32)
++		{
++			rdr->cwekey1_length = 0;
++			memset(rdr->cwekey1, 0, 16);
++		}
++		else
++		{
++			if(key_atob_l(value, rdr->cwekey1, len))
++			{
++				fprintf(stderr, "reader cwekey1 parse error, %s=%s\n", token, value);
++				rdr->cwekey1_length = 0;
++				memset(rdr->cwekey1, 0, sizeof(rdr->cwekey1));
++			}
++			else
++			{
++				rdr->cwekey1_length = len/2;
++			}
++		}
++		return;
++	}
++	int32_t len = rdr->cwekey1_length;
++	if(len > 0)
++	{
++		char tmp[len * 2 + 1];
++		fprintf_conf(f, "cwekey1", "%s\n", cs_hexdump(0, rdr->cwekey1, len, tmp, sizeof(tmp)));
++	}
++	else if(cfg.http_full_cfg)
++		{ fprintf_conf(f, "cwekey1", "\n"); }
++}
++
++static void cwekey2_fn(const char *token, char *value, void *setting, FILE *f)
++{
++	struct s_reader *rdr = setting;
++	if(value)
++	{
++		int32_t len = strlen(value);
++		if(len != 32)
++		{
++			rdr->cwekey2_length = 0;
++			memset(rdr->cwekey2, 0, 16);
++		}
++		else
++		{
++			if(key_atob_l(value, rdr->cwekey2, len))
++			{
++				fprintf(stderr, "reader cwekey2 parse error, %s=%s\n", token, value);
++				rdr->cwekey2_length = 0;
++				memset(rdr->cwekey2, 0, sizeof(rdr->cwekey2));
++			}
++			else
++			{
++				rdr->cwekey2_length = len/2;
++			}
++		}
++		return;
++	}
++	int32_t len = rdr->cwekey2_length;
++	if(len > 0)
++	{
++		char tmp[len * 2 + 1];
++		fprintf_conf(f, "cwekey2", "%s\n", cs_hexdump(0, rdr->cwekey2, len, tmp, sizeof(tmp)));
++	}
++	else if(cfg.http_full_cfg)
++		{ fprintf_conf(f, "cwekey2", "\n"); }
++}
++
++static void cwekey3_fn(const char *token, char *value, void *setting, FILE *f)
++{
++	struct s_reader *rdr = setting;
++	if(value)
++	{
++		int32_t len = strlen(value);
++		if(len != 32)
++		{
++			rdr->cwekey3_length = 0;
++			memset(rdr->cwekey3, 0, 16);
++		}
++		else
++		{
++			if(key_atob_l(value, rdr->cwekey3, len))
++			{
++				fprintf(stderr, "reader cwekey3 parse error, %s=%s\n", token, value);
++				rdr->cwekey3_length = 0;
++				memset(rdr->cwekey3, 0, sizeof(rdr->cwekey3));
++			}
++			else
++			{
++				rdr->cwekey3_length = len/2;
++			}
++		}
++		return;
++	}
++	int32_t len = rdr->cwekey3_length;
++	if(len > 0)
++	{
++		char tmp[len * 2 + 1];
++		fprintf_conf(f, "cwekey3", "%s\n", cs_hexdump(0, rdr->cwekey3, len, tmp, sizeof(tmp)));
++	}
++	else if(cfg.http_full_cfg)
++		{ fprintf_conf(f, "cwekey3", "\n"); }
++}
++
++static void cwekey4_fn(const char *token, char *value, void *setting, FILE *f)
++{
++	struct s_reader *rdr = setting;
++	if(value)
++	{
++		int32_t len = strlen(value);
++		if(len != 32)
++		{
++			rdr->cwekey4_length = 0;
++			memset(rdr->cwekey4, 0, 16);
++		}
++		else
++		{
++			if(key_atob_l(value, rdr->cwekey4, len))
++			{
++				fprintf(stderr, "reader cwekey4 parse error, %s=%s\n", token, value);
++				rdr->cwekey4_length = 0;
++				memset(rdr->cwekey4, 0, sizeof(rdr->cwekey4));
++			}
++			else
++			{
++				rdr->cwekey4_length = len/2;
++			}
++		}
++		return;
++	}
++	int32_t len = rdr->cwekey4_length;
++	if(len > 0)
++	{
++		char tmp[len * 2 + 1];
++		fprintf_conf(f, "cwekey4", "%s\n", cs_hexdump(0, rdr->cwekey4, len, tmp, sizeof(tmp)));
++	}
++	else if(cfg.http_full_cfg)
++	{ fprintf_conf(f, "cwekey4", "\n"); }
++}
++
++static void cwekey5_fn(const char *token, char *value, void *setting, FILE *f)
+ {
+ 	struct s_reader *rdr = setting;
+ 	if(value)
+@@ -560,32 +921,104 @@
+ 		int32_t len = strlen(value);
+ 		if(len != 32)
+ 		{
+-			rdr->cwekey_length = 0;
+-			memset(rdr->cwekey, 0, 16);
++			rdr->cwekey5_length = 0;
++			memset(rdr->cwekey5, 0, 16);
+ 		}
+ 		else
+ 		{
+-			if(key_atob_l(value, rdr->cwekey, len))
++			if(key_atob_l(value, rdr->cwekey5, len))
+ 			{
+-				fprintf(stderr, "reader cwekey parse error, %s=%s\n", token, value);
+-				rdr->cwekey_length = 0;
+-				memset(rdr->cwekey, 0, sizeof(rdr->cwekey));
++				fprintf(stderr, "reader cwekey5 parse error, %s=%s\n", token, value);
++				rdr->cwekey5_length = 0;
++				memset(rdr->cwekey5, 0, sizeof(rdr->cwekey5));
+ 			}
+ 			else
+ 			{
+-				rdr->cwekey_length = len/2;
++				rdr->cwekey5_length = len/2;
+ 			}
+ 		}
+ 		return;
+ 	}
+-	int32_t len = rdr->cwekey_length;
++	int32_t len = rdr->cwekey5_length;
+ 	if(len > 0)
+ 	{
+ 		char tmp[len * 2 + 1];
+-		fprintf_conf(f, "cwekey", "%s\n", cs_hexdump(0, rdr->cwekey, len, tmp, sizeof(tmp)));
++		fprintf_conf(f, "cwekey5", "%s\n", cs_hexdump(0, rdr->cwekey5, len, tmp, sizeof(tmp)));
+ 	}
+ 	else if(cfg.http_full_cfg)
+-		{ fprintf_conf(f, "cwekey", "\n"); }
++		{ fprintf_conf(f, "cwekey5", "\n"); }
++}
++
++static void cwekey6_fn(const char *token, char *value, void *setting, FILE *f)
++{
++	struct s_reader *rdr = setting;
++	if(value)
++	{
++		int32_t len = strlen(value);
++		if(len != 32)
++		{
++			rdr->cwekey6_length = 0;
++			memset(rdr->cwekey6, 0, 16);
++		}
++		else
++		{
++			if(key_atob_l(value, rdr->cwekey6, len))
++			{
++				fprintf(stderr, "reader cwekey6 parse error, %s=%s\n", token, value);
++				rdr->cwekey6_length = 0;
++				memset(rdr->cwekey6, 0, sizeof(rdr->cwekey6));
++			}
++			else
++			{
++				rdr->cwekey6_length = len/2;
++			}
++		}
++		return;
++	}
++	int32_t len = rdr->cwekey6_length;
++	if(len > 0)
++	{
++		char tmp[len * 2 + 1];
++		fprintf_conf(f, "cwekey6", "%s\n", cs_hexdump(0, rdr->cwekey6, len, tmp, sizeof(tmp)));
++	}
++	else if(cfg.http_full_cfg)
++		{ fprintf_conf(f, "cwekey6", "\n"); }
++}
++
++static void cwekey7_fn(const char *token, char *value, void *setting, FILE *f)
++{
++	struct s_reader *rdr = setting;
++	if(value)
++	{
++		int32_t len = strlen(value);
++		if(len != 32)
++		{
++			rdr->cwekey7_length = 0;
++			memset(rdr->cwekey7, 0, 16);
++		}
++		else
++		{
++			if(key_atob_l(value, rdr->cwekey7, len))
++			{
++				fprintf(stderr, "reader cwekey7 parse error, %s=%s\n", token, value);
++				rdr->cwekey7_length = 0;
++				memset(rdr->cwekey7, 0, sizeof(rdr->cwekey7));
++			}
++			else
++			{
++				rdr->cwekey7_length = len/2;
++			}
++		}
++		return;
++	}
++	int32_t len = rdr->cwekey7_length;
++	if(len > 0)
++	{
++		char tmp[len * 2 + 1];
++		fprintf_conf(f, "cwekey7", "%s\n", cs_hexdump(0, rdr->cwekey7, len, tmp, sizeof(tmp)));
++	}
++	else if(cfg.http_full_cfg)
++		{ fprintf_conf(f, "cwekey7", "\n"); }
+ }
+ #endif
+ 
+@@ -1091,6 +1524,7 @@
+ 	DEF_OPT_INT32("reconnecttimeout"              , OFS(tcp_rto),                         DEFAULT_TCP_RECONNECT_TIMEOUT),
+ 	DEF_OPT_INT32("reconnectdelay"                , OFS(tcp_reconnect_delay),             60000),
+ 	DEF_OPT_INT32("resetcycle"                    , OFS(resetcycle),                      0),
++	DEF_OPT_INT32("wdelay"                        , OFS(wdelay),                          0),
+ 	DEF_OPT_INT8("disableserverfilter"            , OFS(ncd_disable_server_filt),         0),
+ 	DEF_OPT_INT8("connectoninit"                  , OFS(ncd_connect_on_init),             0),
+ 	DEF_OPT_UINT8("keepalive"                     , OFS(keepalive),                       0),
+@@ -1115,16 +1549,33 @@
+ 	DEF_OPT_FUNC("boxid"                          , 0,                                    boxid_fn),
+ 	DEF_OPT_FUNC("boxkey"                         , 0,                                    boxkey_fn),
+ 	DEF_OPT_FUNC("rsakey"                         , 0,                                    rsakey_fn),
++	DEF_OPT_FUNC("cwpkkey"                        , 0,                                    cwpkkey_fn),
+ 	DEF_OPT_FUNC("deskey"                         , 0,                                    deskey_fn),
+ #ifdef READER_NAGRA_MERLIN
+ 	DEF_OPT_FUNC("mod1"                           , 0,                                    mod1_fn),
++	DEF_OPT_FUNC("idird"                          , 0,                                    idird_fn),
++	DEF_OPT_FUNC("cmd0eprov"                      , 0,                                    cmd0eprov_fn),
++	DEF_OPT_FUNC("mod2"                           , 0,                                    mod2_fn),
++	DEF_OPT_FUNC("key3588"                        , 0,                                    key3588_fn),
++	DEF_OPT_FUNC("key3460"                        , 0,                                    key3460_fn),
++	DEF_OPT_FUNC("key3310"                        , 0,                                    key3310_fn),
+ 	DEF_OPT_FUNC("data50"                         , 0,                                    data50_fn),
+ 	DEF_OPT_FUNC("mod50"                          , 0,                                    mod50_fn),
+-	DEF_OPT_FUNC("key60"                          , 0,                                    key60_fn),
+-	DEF_OPT_FUNC("exp60"                          , 0,                                    exp60_fn),
+ 	DEF_OPT_FUNC("nuid"                           , 0,                                    nuid_fn),
+-	DEF_OPT_FUNC("cwekey"                         , 0,                                    cwekey_fn),
++	DEF_OPT_FUNC("cwekey0"                        , 0,                                    cwekey0_fn),
++	DEF_OPT_FUNC("cwekey1"                        , 0,                                    cwekey1_fn),
++	DEF_OPT_FUNC("cwekey2"                        , 0,                                    cwekey2_fn),
++	DEF_OPT_FUNC("cwekey3"                        , 0,                                    cwekey3_fn),
++	DEF_OPT_FUNC("cwekey4"                        , 0,                                    cwekey4_fn),
++	DEF_OPT_FUNC("cwekey5"                        , 0,                                    cwekey5_fn),
++	DEF_OPT_FUNC("cwekey6"                        , 0,                                    cwekey6_fn),
++	DEF_OPT_FUNC("cwekey7"                        , 0,                                    cwekey7_fn),
++	DEF_OPT_INT8("forcecwswap"                    , OFS(forcecwswap),                     0),
++	DEF_OPT_INT8("evensa"                         , OFS(evensa),                          0),
++	DEF_OPT_INT8("forceemmg"                      , OFS(forceemmg),                       0),
+ #endif
++
++	DEF_OPT_INT8("cak7_mode"                      , OFS(cak7_mode),                       0),
+ 	DEF_OPT_FUNC_X("ins7e"                        , OFS(ins7E),                           ins7E_fn, SIZEOF(ins7E)),
+ 	DEF_OPT_FUNC_X("ins7e11"                      , OFS(ins7E11),                         ins7E_fn, SIZEOF(ins7E11)),
+ 	DEF_OPT_FUNC_X("ins2e06"                      , OFS(ins2e06),                         ins7E_fn, SIZEOF(ins2e06)),
+@@ -1200,6 +1651,7 @@
+ #endif
+ 	DEF_OPT_INT8("deprecated"                     , OFS(deprecated),                      0),
+ 	DEF_OPT_INT8("audisabled"                     , OFS(audisabled),                      0),
++	DEF_OPT_INT8("autype"                         , OFS(autype),                          0),
+ 	DEF_OPT_FUNC("auprovid"                       , 0,                                    auprovid_fn),
+ 	DEF_OPT_INT8("ndsversion"                     , OFS(ndsversion),                      0),
+ 	DEF_OPT_FUNC("ratelimitecm"                   , 0,                                    ratelimitecm_fn),
+@@ -1230,15 +1682,18 @@
+ 	// These are written only when the reader is physical reader
+ 	static const char *hw_only_settings[] =
+ 	{
+-		"readnano", "resetcycle", "smargopatch", "autospeed", "sc8in1_dtrrts_patch", "boxid","fix07",
++		"readnano", "resetcycle", "wdelay", "smargopatch", "autospeed", "sc8in1_dtrrts_patch", "boxid","fix07",
+ 		"fix9993", "rsakey", "deskey", "ins7e", "ins7e11", "ins2e06", "force_irdeto", "needsemmfirst", "boxkey",
+ 		"atr", "detect", "nagra_read", "mhz", "cardmhz", "readtiers", "read_old_classes", "use_gpio", "needsglobalfirst",
+ #ifdef READER_NAGRA_MERLIN
+-		"mod1", "data50", "mod50", "key60", "exp60", "nuid", "cwekey",
++		"mod1", "idird", "cmd0eprov", "mod2", "key3588", "key3460", "key3310", "data50", "mod50", "nuid", "cwekey0", "cwekey1", "cwekey2", "cwekey3", "cwekey4", "cwekey5", "cwekey6", "cwekey7",
+ #endif
+ #if defined(READER_DRE) || defined(READER_DRECAS)
+ 		"exec_cmd_file",
+ #endif
++#if READER_CONAX
++		"cwpkkey",
++#endif
+ #ifdef WITH_AZBOX
+ 		"mode",
+ #endif
+@@ -1248,7 +1703,7 @@
+ 	// These are written only when the reader is network reader
+ 	static const char *network_only_settings[] =
+ 	{
+-		"user", "inactivitytimeout", "reconnecttimeout",
++		"user", "inactivitytimeout", "reconnecttimeout", "autype",
+ 		0
+ 	};
+ 	if(is_network_reader(reader))
+Index: reader-common.c
+--- reader-common.c	(revision 11569)
++++ reader-common.c	(working copy)
+@@ -37,6 +37,7 @@
+ 	reader->csystem = NULL;
+ 	memset(reader->hexserial, 0, sizeof(reader->hexserial));
+ 	memset(reader->prid, 0xFF, sizeof(reader->prid));
++	memset(reader->sa, 0, sizeof(reader->sa));
+ 	reader->caid = 0;
+ 	reader->nprov = 0;
+ 	cs_clear_entitlement(reader);
+Index: reader-conax.c
+--- reader-conax.c	(revision 11569)
++++ reader-conax.c	(working copy)
+@@ -2,6 +2,91 @@
+ #ifdef READER_CONAX
+ #include "cscrypt/bn.h"
+ #include "reader-common.h"
++#include "cscrypt/des.h"
++
++static int32_t CWPK_CNX(struct s_reader *reader,uint8_t *msg)
++{
++int32_t ret = 0;
++
++uint8_t CWp1[8];
++uint8_t CWp2[8];
++uint8_t CWs1[8];
++uint8_t CWs2[8];
++
++CWp1[0] = msg[7];
++CWp1[1] = msg[8];
++CWp1[2] = msg[9];
++CWp1[3] = msg[10];
++CWp1[4] = msg[11];
++CWp1[5] = msg[12];
++CWp1[6] = msg[13];
++CWp1[7] = msg[14];
++
++CWp2[0] = msg[22];
++CWp2[1] = msg[23];
++CWp2[2] = msg[24];
++CWp2[3] = msg[25];
++CWp2[4] = msg[26];
++CWp2[5] = msg[27];
++CWp2[6] = msg[28];
++CWp2[7] = msg[29];
++
++des_ecb3_decrypt(CWp1,reader->cwpk_mod);
++des_ecb3_decrypt(CWp2,reader->cwpk_mod);
++CWs1[0] = CWp1[4];
++CWs1[1] = CWp1[5];
++CWs1[2] = CWp1[6];
++CWs1[3] = CWp1[7];
++CWs1[4] = CWp1[0];
++CWs1[5] = CWp1[1];
++CWs1[6] = CWp1[2];
++CWs1[7] = CWp1[3];
++
++CWs2[0] = CWp2[4];
++CWs2[1] = CWp2[5];
++CWs2[2] = CWp2[6];
++CWs2[3] = CWp2[7];
++CWs2[4] = CWp2[0];
++CWs2[5] = CWp2[1];
++CWs2[6] = CWp2[2];
++CWs2[7] = CWp2[3];
++
++int chkok = 1;
++if(((CWs1[0] + CWs1[1] + CWs1[2]) & 0xFF) != CWs1[3])
++{
++	chkok = 0;
++	rdr_log(reader, "CW0 checksum error [0]");
++}
++if(((CWs1[4] + CWs1[5] + CWs1[6]) & 0xFF) != CWs1[7])
++{
++	chkok = 0;
++	rdr_log(reader, "CW0 checksum error [1]");
++}
++if(((CWs2[0] + CWs2[1] + CWs2[2]) & 0xFF) != CWs2[3])
++{
++	chkok = 0;
++	rdr_log(reader, "CW1 checksum error [0]");
++}
++if(((CWs2[4] + CWs2[5] + CWs2[6]) & 0xFF) != CWs2[7])
++{
++	chkok = 0;
++	rdr_log(reader, "CW1 checksum error [1]");
++}
++
++if(chkok == 1)
++{
++	memcpy(&msg[7],CWs1,0x08);
++	memcpy(&msg[22],CWs2,0x08);
++
++	ret = 0;
++}
++if(chkok != 1)
++{
++	ret = -8;
++}
++
++return ret;
++}
+ 
+ static int32_t RSA_CNX(struct s_reader *reader, uint8_t *msg, uint8_t *mod, uint8_t *exp, uint32_t cta_lr, uint32_t modbytes, uint32_t expbytes)
+ {
+@@ -114,6 +199,26 @@
+ 	return (cta_lr - 2);
+ }
+ 
++static int32_t check_pairing(struct s_reader *reader, const uint8_t *cmd, const uint8_t *data, uint8_t *cta_res)
++{
++	uint16_t cta_lr;
++
++	if(reader->cwpk_mod_length)
++	{
++		write_cmd(cmd, data);
++		rdr_log(reader, "CWPK Pairing is active");
++	}
++	else if(reader->rsa_mod_length)
++	{
++		rdr_log(reader, "RSA Pairing is active");
++	}
++	else
++	{
++		rdr_log(reader, "Pairing is not active");
++	}
++	return OK;
++}
++
+ static uint8_t PairingECMRotation(struct s_reader *reader, const ECM_REQUEST *er, int32_t n)
+ {
+ 	uint8_t cta_res[CTA_RES_LEN] = { 0x00 };
+@@ -147,6 +252,7 @@
+ 	uint8_t cta_res[CTA_RES_LEN];
+ 	int32_t i, j, n;
+ 	static const uint8_t ins26[] = { 0xDD, 0x26, 0x00, 0x00, 0x03, 0x10, 0x01, 0x40 };
++	static const uint8_t inscp[] = { 0xDD, 0x26, 0x00, 0x00, 0x04, 0x6C, 0x02, 0x10,0x00 };
+ 	uint8_t ins82[] = { 0xDD, 0x82, 0x00, 0x00, 0x11, 0x11, 0x0f, 0x01, 0xb0, 0x0f, 0xff,
+ 						0xff, 0xfb, 0x00, 0x00, 0x09, 0x04, 0x0b, 0x00, 0xe0, 0x30, 0x2b };
+ 
+@@ -213,6 +319,7 @@
+ 		rdr_log(reader, "Provider: %d Provider-Id: %06X", j + 1, b2i(4, reader->prid[j]));
+ 		rdr_log_sensitive(reader, "Provider: %d SharedAddress: {%08X}", j + 1, b2i(4, reader->sa[j]));
+ 	}
++	check_pairing(reader, inscp, inscp + 5, cta_res);
+ 
+ 	return OK;
+ }
+@@ -239,16 +346,37 @@
+ 	uint8_t exp[] = { 0x01, 0x00, 0x01 };
+ 	uint8_t buf[256];
+ 
++	char ppp = 0x00;
++
+ 	if((n = check_sct_len(er->ecm, 3)) < 0)
+ 		{ return ERROR; }
+ 
+ 	buf[0] = 0x14;
+ 	buf[1] = n + 1;
+ 
+-	if(0x0 != PairingECMRotation(reader, er, n))
+-		{ buf[2] = 2; } // card will answer with encrypted dw
++	if(reader->cwpk_mod_length)
++	{
++		buf[2] = 4;
++		ppp = 0x01;
++	}
++	else if(0x0 != reader->rsa_mod[0])
++	{
++		if(0x0 != PairingECMRotation(reader, er, n))
++		{
++			buf[2] = 2;
++			ppp = 0x03;
++		}
++		else
++		{
++			buf[2] = 0;
++			ppp = 0x02;
++		}
++	}
+ 	else
+-		{ buf[2] = 0; }
++	{
++		buf[2] = 0;
++		ppp = 0x02;
++	}
+ 
+ 	memcpy(buf + 3, er->ecm, n);
+ 	insA2[4] = n + 3;
+@@ -263,13 +391,20 @@
+ 		if((cta_res[cta_lr - 2] == 0x98) || ((cta_res[cta_lr - 2] == 0x90)))
+ 		{
+ 			/*checks if answer is encrypted with RSA algo and decrypts it if needed*/
+-			if(0x81 == cta_res[0] && 2 == cta_res[2] >> 5) /*81 XX 5X*/
++			if(0x81 == cta_res[0] && 2 == cta_res[2] >> 5 && 0x03 == ppp) /*81 XX 5X*/
+ 			{
+ 				if(0x00 == cta_res[cta_lr - 1])
+ 					{ rc = RSA_CNX(reader, cta_res, reader->rsa_mod, exp, cta_lr, 64u, 3u); }
+ 				else
+ 					{ rc = -4; } /*card has no right to decode this channel*/
+ 			}
++			if(0x01 == ppp && 0x00 == cta_res[cta_lr - 1])
++			{
++			/*trying to decode using CWPK*/
++			rc = CWPK_CNX(reader, cta_res);		/*enabled when no loging needed*/
++			}
++			if(0x12 == cta_res[cta_lr - 1])
++			{ rc = -4; }
+ 
+ 			if(0 == rc)
+ 			{
+@@ -341,6 +476,10 @@
+ 		case -4:
+ 			rdr_log(reader, "card has no right to decode this channel");
+ 			break;
++
++		case -8:
++			rdr_log(reader, "CWPK is faulty");
++			break;
+ 	}
+ 
+ 	/* answer 9011 - conax smart card need reset */
+Index: reader-nagra.c
+--- reader-nagra.c	(revision 11569)
++++ reader-nagra.c	(working copy)
+@@ -792,7 +792,7 @@
+ 		}
+ 		memcpy(reader->rom, cta_res + 2, 15);
+ 	}
+-	else if(reader->detect_seca_nagra_tunneled_card && memcmp(atr + 7, "pp", 2) == 0 && ((atr[9]&0x0F) >= 10))
++	else if(!reader->cak7_mode && reader->detect_seca_nagra_tunneled_card && memcmp(atr + 7, "pp", 2) == 0 && ((atr[9]&0x0F) >= 10))
+ 	{
+ 		rdr_log(reader, "detect seca/nagra tunneled card");
+ 
+Index: reader-nagra-common.c
+--- reader-nagra-common.c	(revision 11569)
++++ reader-nagra-common.c	(working copy)
+@@ -2,83 +2,470 @@
+ #include "reader-common.h"
+ #include "reader-nagra-common.h"
+ 
+-// returns 1 if shared emm matches SA, unique emm matches serial, or global or unknown
++int32_t get_prov_idx(struct s_reader *rdr, const uint8_t *provid)
++{
++	int prov;
++	for(prov = 0; prov < rdr->nprov; prov++) // search for provider index
++	{
++		if(!memcmp(provid, &rdr->prid[prov][2], 2))
++		{
++			return (prov);
++		}
++	}
++	return (-1);
++}
++
+ int32_t nagra_get_emm_type(EMM_PACKET *ep, struct s_reader *rdr)
+ {
+-	switch(ep->emm[0])
++	if(rdr->cak7type == 3 || rdr->autype == 1)
+ 	{
+-		case 0x83:
+-			memset(ep->hexserial, 0x00, 0x08);
+-			ep->hexserial[0] = ep->emm[5];
+-			ep->hexserial[1] = ep->emm[4];
+-			ep->hexserial[2] = ep->emm[3];
+-			if(ep->emm[7] == 0x10)
+-			{
+-				ep->type = SHARED;
+-				return (!memcmp(rdr->sa[0], ep->hexserial, 0x03));
+-			}
+-			else
+-			{
+-				ep->hexserial[3] = ep->emm[6];
++		int i;
++
++		switch(ep->emm[0])
++		{
++			case 0x82:
+ 				ep->type = UNIQUE;
+-				return (!memcmp(rdr->hexserial + 2, ep->hexserial, 0x04));
+-			}
++				memset(ep->hexserial, 0, 8);
++				memcpy(ep->hexserial, ep->emm + 3, 6);
+ 
+-		case 0x82:
+-			ep->type = GLOBAL;
+-			return 1;
++				return (!memcmp(rdr->hexserial, ep->hexserial, 6));
+ 
+-		default:
+-			ep->type = UNKNOWN;
+-			return 1;
++			case 0x84:
++				ep->type = SHARED;
++				memset(ep->hexserial, 0, 8);
++				memcpy(ep->hexserial, ep->emm + 5, 3);
++				i = get_prov_idx(rdr, ep->emm + 3);
++
++				if(i == -1)
++				{
++					return 0;
++				}
++
++				return (!memcmp(rdr->sa[i], ep->hexserial, 3));
++
++			case 0x83:
++				ep->type = GLOBAL;
++				uint8_t filtr[] = {0x83, 0x00, 0x74};
++				return (!memcmp(ep->emm, filtr, 3));
++
++			default:
++				ep->type = UNKNOWN;
++				return 0;
++		}
++	}
++	else if(rdr->cak7type == 1)
++	{
++		int i;
++		switch(ep->emm[0])
++		{
++			case 0x82:
++				ep->type = GLOBAL;
++				if(rdr->emm82 == 1)
++				{
++					return 1;
++				}
++				return 0;
++
++			case 0x83:
++				if(ep->emm[7] == 0x10)
++				{
++					ep->type = SHARED;
++
++					for(i = 0; i < rdr->nemm83s; i++)
++					{
++						if(!memcmp(rdr->emm83s[i] + 1, ep->emm + 3, 0x03))
++						{
++							return 1;
++						}
++					}
++				}
++				else
++				{
++					ep->type = UNIQUE;
++
++					for(i = 0; i < rdr->nemm83u; i++)
++					{
++						if(!memcmp(rdr->emm83u[i] + 1, ep->emm + 3, 0x04))
++						{
++							return 1;
++						}
++					}
++				}
++				return 0;
++
++			case 0x84:
++				ep->type = GLOBAL;
++
++				for(i = 0; i < rdr->nemm84; i++)
++				{
++					if(!memcmp(rdr->emm84[i] + 1, ep->emm + 3, 0x02))
++					{
++						return 1;
++					}
++				}
++				return 0;
++
++			case 0x87:
++				ep->type = SHARED;
++
++				for(i = 0; i < rdr->nemm87; i++)
++				{
++					if(!memcmp(rdr->emm87[i] + 1, ep->emm + 3, 0x03))
++					{
++						return 1;
++					}
++				}
++				return 0;
++
++			default:
++				ep->type = UNKNOWN;
++				return 0;
++		}
++	}
++	else if(rdr->autype == 2)
++	{
++		int i;
++		switch(ep->emm[0])
++		{
++			case 0x82:
++				ep->type = GLOBAL;
++				return 1;
++
++			case 0x83:
++				memset(ep->hexserial, 0x00, 0x08);
++				ep->hexserial[0] = ep->emm[5];
++				ep->hexserial[1] = ep->emm[4];
++				ep->hexserial[2] = ep->emm[3];
++				if(ep->emm[7] == 0x10)
++				{
++					ep->type = SHARED;
++
++					for(i = 0; i < rdr->nprov; i++)
++					{
++						if(!memcmp(rdr->sa[i], "\x00\x00\x00", 3))
++						{
++							continue;
++						}
++
++						if(!memcmp(rdr->sa[i], ep->hexserial, 0x03))
++						{
++							return 1;
++						}
++					}
++				}
++				else
++				{
++					ep->hexserial[3] = ep->emm[6];
++					ep->type = UNIQUE;
++
++					return (!memcmp(rdr->hexserial + 2, ep->hexserial, 0x04));
++				}
++				return 0;
++
++			case 0x84:
++				ep->type = GLOBAL;
++				return 1;
++
++			case 0x87:
++				memset(ep->hexserial, 0x00, 0x08);
++				ep->hexserial[0] = ep->emm[5];
++				ep->hexserial[1] = ep->emm[4];
++				ep->hexserial[2] = ep->emm[3];
++				ep->type = SHARED;
++
++				for(i = 0; i < rdr->nprov; i++)
++				{
++					if(!memcmp(rdr->sa[i], "\x00\x00\x00", 3))
++					{
++						continue;
++					}
++					if(!memcmp(rdr->sa[i], ep->hexserial, 0x03))
++					{
++						return 1;
++					}
++				}
++				return 0;
++
++			default:
++				ep->type = UNKNOWN;
++				return 0;
++		}
++	}
++	else
++	{
++		switch(ep->emm[0])
++		{
++			case 0x83:
++				memset(ep->hexserial, 0x00, 0x08);
++				ep->hexserial[0] = ep->emm[5];
++				ep->hexserial[1] = ep->emm[4];
++				ep->hexserial[2] = ep->emm[3];
++				if(ep->emm[7] == 0x10)
++				{
++					ep->type = SHARED;
++					return (!memcmp(rdr->sa[0], ep->hexserial, 0x03));
++				}
++				else
++				{
++					ep->hexserial[3] = ep->emm[6];
++					ep->type = UNIQUE;
++					return (!memcmp(rdr->hexserial + 2, ep->hexserial, 0x04));
++				}
++
++			case 0x82:
++				ep->type = GLOBAL;
++				return 1;
++
++			default:
++				ep->type = UNKNOWN;
++				return 0;
++		}
+ 	}
+ }
+ 
+ int32_t nagra_get_emm_filter(struct s_reader *rdr, struct s_csystem_emm_filter **emm_filters, unsigned int *filter_count)
+ {
+-	if(*emm_filters == NULL)
++	if(rdr->cak7type == 3 || rdr->autype == 1)
++	{
++		if(*emm_filters == NULL)
++		{
++			const unsigned int max_filter_count = 1 + (2 * rdr->nprov);
++			if(!cs_malloc(emm_filters, max_filter_count * sizeof(struct s_csystem_emm_filter)))
++			{
++				return ERROR;
++			}
++
++			struct s_csystem_emm_filter *filters = *emm_filters;
++			*filter_count = 0;
++
++			int32_t idx = 0;
++
++			filters[idx].type = EMM_UNIQUE;
++			filters[idx].enabled = 1;
++			filters[idx].filter[0] = 0x82;
++			filters[idx].mask[0] = 0xFF;
++			memcpy(&filters[idx].filter[1], rdr->hexserial, 6);
++			memset(&filters[idx].mask[1], 0xFF, 6);
++			idx++;
++
++			int32_t prov;
++			for(prov = 0; prov < rdr->nprov; prov++)
++			{
++				if(!memcmp(rdr->sa[prov], "\x00\x00\x00", 3))
++				{
++					continue;
++				}
++
++				filters[idx].type = EMM_GLOBAL;
++				filters[idx].enabled = 1;
++				filters[idx].filter[0] = 0x83;
++				filters[idx].mask[0] = 0xFF;
++				memcpy(&filters[idx].filter[1], &rdr->prid[prov][2], 2);
++				memset(&filters[idx].mask[1], 0xFF, 2);
++				idx++;
++
++				filters[idx].type = EMM_SHARED;
++				filters[idx].enabled = 1;
++				filters[idx].filter[0] = 0x84;
++				filters[idx].mask[0] = 0xFF;
++				memcpy(&filters[idx].filter[1], &rdr->prid[prov][2], 2);
++				memset(&filters[idx].mask[1], 0xFF, 2);
++				memcpy(&filters[idx].filter[3], &rdr->sa[prov], 3);
++				memset(&filters[idx].mask[3], 0xFF, 3);
++				idx++;
++			}
++
++			*filter_count = idx;
++		}
++
++		return OK;
++	}
++	else if(rdr->cak7type == 1)
+ 	{
+-		const unsigned int max_filter_count = 3;
+-		if(!cs_malloc(emm_filters, max_filter_count * sizeof(struct s_csystem_emm_filter)))
++		if(*emm_filters == NULL)
+ 		{
+-			return ERROR;
++			const unsigned int max_filter_count = 1 + (4 * rdr->nprov);
++			if(!cs_malloc(emm_filters, max_filter_count * sizeof(struct s_csystem_emm_filter)))
++			{
++				return ERROR;
++			}
++
++			struct s_csystem_emm_filter *filters = *emm_filters;
++			*filter_count = 0;
++
++			int32_t idx = 0;
++
++			if(rdr->emm82 == 1)
++			{
++				filters[idx].type = EMM_GLOBAL;
++				filters[idx].enabled = 1;
++				filters[idx].filter[0] = 0x82;
++				filters[idx].mask[0] = 0xFF;
++				idx++;
++			}
++
++			int32_t i;
++			for(i = 0; i < rdr->nemm83u; i++)
++			{
++				filters[idx].type = EMM_UNIQUE;
++				filters[idx].enabled = 1;
++				memcpy(&filters[idx].filter[0], rdr->emm83u[i], 6);
++				memset(&filters[idx].mask[0], 0xFF, 6);
++				idx++;
++			}
++
++			for(i = 0; i < rdr->nemm83s; i++)
++			{
++				filters[idx].type = EMM_SHARED;
++				filters[idx].enabled = 1;
++				memcpy(&filters[idx].filter[0], rdr->emm83s[i], 6);
++				memset(&filters[idx].mask[0], 0xFF, 6);
++				idx++;
++			}
++
++			for(i = 0; i < rdr->nemm84; i++)
++			{
++				filters[idx].type = EMM_GLOBAL;
++				filters[idx].enabled = 1;
++				memcpy(&filters[idx].filter[0], rdr->emm84[i], 3);
++				memset(&filters[idx].mask[0], 0xFF, 3);
++				idx++;
++			}
++
++			for(i = 0; i < rdr->nemm87; i++)
++			{
++				filters[idx].type = EMM_SHARED;
++				filters[idx].enabled = 1;
++				memcpy(&filters[idx].filter[0], rdr->emm87[i], 6);
++				memset(&filters[idx].mask[0], 0xFF, 6);
++				idx++;
++			}
++
++			*filter_count = idx;
+ 		}
+ 
+-		struct s_csystem_emm_filter *filters = *emm_filters;
+-		*filter_count = 0;
+-
+-		int32_t idx = 0;
+-
+-		filters[idx].type = EMM_UNIQUE;
+-		filters[idx].enabled = 1;
+-		filters[idx].filter[0] = 0x83;
+-		filters[idx].filter[1] = rdr->hexserial[4];
+-		filters[idx].filter[2] = rdr->hexserial[3];
+-		filters[idx].filter[3] = rdr->hexserial[2];
+-		filters[idx].filter[4] = rdr->hexserial[5];
+-		filters[idx].filter[5] = 0x00;
+-		memset(&filters[idx].mask[0], 0xFF, 6);
+-		idx++;
+-
+-		filters[idx].type = EMM_SHARED;
+-		filters[idx].enabled = 1;
+-		filters[idx].filter[0] = 0x83;
+-		filters[idx].filter[1] = rdr->sa[0][2];
+-		filters[idx].filter[2] = rdr->sa[0][1];
+-		filters[idx].filter[3] = rdr->sa[0][0];
+-		filters[idx].filter[4] = 0x00;
+-		filters[idx].filter[5] = 0x10;
+-		memset(&filters[idx].mask[0], 0xFF, 6);
+-		idx++;
+-
+-		filters[idx].type = EMM_GLOBAL;
+-		filters[idx].enabled = 1;
+-		filters[idx].filter[0] = 0x82;
+-		filters[idx].mask[0] = 0xFF;
+-		idx++;
++		return OK;
++	}
++	else if(rdr->autype == 2)
++	{
++		if(*emm_filters == NULL)
++		{
++			const unsigned int max_filter_count = 3 + (2 * rdr->nprov);
++			if(!cs_malloc(emm_filters, max_filter_count * sizeof(struct s_csystem_emm_filter)))
++			{
++				return ERROR;
++			}
++
++			struct s_csystem_emm_filter *filters = *emm_filters;
++			*filter_count = 0;
++
++			int32_t idx = 0;
++
++			filters[idx].type = EMM_GLOBAL;
++			filters[idx].enabled = 1;
++			filters[idx].filter[0] = 0x82;
++			filters[idx].mask[0] = 0xFF;
++			idx++;
++
++			filters[idx].type = EMM_GLOBAL;
++			filters[idx].enabled = 1;
++			filters[idx].filter[0] = 0x84;
++			filters[idx].mask[0] = 0xFF;
++			idx++;
++
++			filters[idx].type = EMM_UNIQUE;
++			filters[idx].enabled = 1;
++			filters[idx].filter[0] = 0x83;
++			filters[idx].filter[1] = rdr->hexserial[4];
++			filters[idx].filter[2] = rdr->hexserial[3];
++			filters[idx].filter[3] = rdr->hexserial[2];
++			filters[idx].filter[4] = rdr->hexserial[5];
++			filters[idx].filter[5] = 0x00;
++			memset(&filters[idx].mask[0], 0xFF, 6);
++			idx++;
++
++			int i;
++			for(i = 0; i < rdr->nprov; i++)
++			{
++				if(!memcmp(rdr->sa[i], "\x00\x00\x00", 3))
++				{
++					continue;
++				}
++
++			filters[idx].type = EMM_SHARED;
++			filters[idx].enabled = 1;
++			filters[idx].filter[0] = 0x83;
++			filters[idx].filter[1] = rdr->sa[i][2];
++			filters[idx].filter[2] = rdr->sa[i][1];
++			filters[idx].filter[3] = rdr->sa[i][0];
++			filters[idx].filter[4] = 0x00;
++			filters[idx].filter[5] = 0x10;
++			memset(&filters[idx].mask[0], 0xFF, 6);
++			idx++;
++
++			filters[idx].type = EMM_SHARED;
++			filters[idx].enabled = 1;
++			filters[idx].filter[0] = 0x87;
++			filters[idx].filter[1] = rdr->sa[i][2];
++			filters[idx].filter[2] = rdr->sa[i][1];
++			filters[idx].filter[3] = rdr->sa[i][0];
++			filters[idx].filter[4] = 0x00;
++			filters[idx].filter[5] = 0x00;
++			memset(&filters[idx].mask[0], 0xFF, 6);
++			idx++;
++			}
++
++			*filter_count = idx;
++		}
+ 
+-		*filter_count = idx;
++		return OK;
+ 	}
++	else
++	{
++		if(*emm_filters == NULL)
++		{
++			const unsigned int max_filter_count = 3;
++			if(!cs_malloc(emm_filters, max_filter_count * sizeof(struct s_csystem_emm_filter)))
++			{
++				return ERROR;
++			}
++
++			struct s_csystem_emm_filter *filters = *emm_filters;
++			*filter_count = 0;
+ 
+-	return OK;
++			int32_t idx = 0;
++
++			filters[idx].type = EMM_UNIQUE;
++			filters[idx].enabled = 1;
++			filters[idx].filter[0] = 0x83;
++			filters[idx].filter[1] = rdr->hexserial[4];
++			filters[idx].filter[2] = rdr->hexserial[3];
++			filters[idx].filter[3] = rdr->hexserial[2];
++			filters[idx].filter[4] = rdr->hexserial[5];
++			filters[idx].filter[5] = 0x00;
++			memset(&filters[idx].mask[0], 0xFF, 6);
++			idx++;
++
++			filters[idx].type = EMM_SHARED;
++			filters[idx].enabled = 1;
++			filters[idx].filter[0] = 0x83;
++			filters[idx].filter[1] = rdr->sa[0][2];
++			filters[idx].filter[2] = rdr->sa[0][1];
++			filters[idx].filter[3] = rdr->sa[0][0];
++			filters[idx].filter[4] = 0x00;
++			filters[idx].filter[5] = 0x10;
++			memset(&filters[idx].mask[0], 0xFF, 6);
++			idx++;
++
++			filters[idx].type = EMM_GLOBAL;
++			filters[idx].enabled = 1;
++			filters[idx].filter[0] = 0x82;
++			filters[idx].mask[0] = 0xFF;
++			idx++;
++
++			*filter_count = idx;
++		}
++
++		return OK;
++	}
+ }
+Index: reader-nagracak7.c
+--- reader-nagracak7.c	(revision 11569)
++++ reader-nagracak7.c	(working copy)
+@@ -13,8 +13,6 @@
+ 
+ static const uint8_t public_exponent[] = { 0x01, 0x00, 0x01 };
+ static const uint8_t d00ff[] = { 0x00, 0xFF, 0xFF, 0xFF };
+-static const uint8_t irdid[] = { 0x64, 0x65, 0x6D, 0x6F }; // fake -> ASCII HEX-bytes of "demo"
+-static const uint8_t data1[] = { 0x00, 0x00, 0x00, 0x01 };
+ 
+ // Datatypes
+ #define IRDINFO 0x03
+@@ -34,7 +32,7 @@
+ 	return ut;
+ }
+ 
+-void rsa_decrypt(uint8_t *edata50, int len, uint8_t *out, uint8_t *key, int keylen)
++static void rsa_decrypt(uint8_t *edata50, int len, uint8_t *out, uint8_t *key, int keylen)
+ {
+ 	BN_CTX *ctx0 = BN_CTX_new();
+ #ifdef WITH_LIBCRYPTO
+@@ -56,12 +54,12 @@
+ 
+ static void addProvider(struct s_reader *reader, uint8_t *cta_res)
+ {
+-	uint8_t i;
++	int i;
+ 	bool toadd = true;
+ 
+ 	for(i = 0; i < reader->nprov; i++)
+ 	{
+-		if((cta_res[19] == reader->prid[i][2]) && (cta_res[20] == reader->prid[i][3]))
++		if((cta_res[0] == reader->prid[i][2]) && (cta_res[1] == reader->prid[i][3]))
+ 		{
+ 			toadd = false;
+ 		}
+@@ -71,13 +69,195 @@
+ 	{
+ 		reader->prid[reader->nprov][0] = 0;
+ 		reader->prid[reader->nprov][1] = 0;
+-		reader->prid[reader->nprov][2] = cta_res[19];
+-		reader->prid[reader->nprov][3] = cta_res[20];
+-		memcpy(reader->sa[reader->nprov], reader->sa[0], 0x04);
++		reader->prid[reader->nprov][2] = cta_res[0];
++		reader->prid[reader->nprov][3] = cta_res[1];
++
+ 		reader->nprov += 1;
+ 	}
+ }
+ 
++static int32_t get_prov_index(struct s_reader *reader, const uint8_t *provid)
++{
++	int prov;
++	for(prov = 0; prov < reader->nprov; prov++)
++	{
++		if(!memcmp(provid, &reader->prid[prov][2], 2))
++		{
++			return (prov);
++		}
++	}
++	return (-1);
++}
++
++static void addSA(struct s_reader *reader, uint8_t *cta_res)
++{
++	if((cta_res[0] == 0x83 && cta_res[5] == 0x10) || cta_res[0] == 0x87)
++	{
++		int i;
++		bool toadd = true;
++
++		if(reader->evensa)
++		{
++			unsigned long sax = (cta_res[3] << 16) + (cta_res[2] << 8) + (cta_res[1]);
++			if(sax % 2 != 0)
++			{
++				sax--;
++				cta_res[3]=(sax>>16)&0xFF;
++				cta_res[2]=(sax>>8)&0xFF;
++				cta_res[1]=(sax)&0xFF;
++			}
++		}
++
++		for(i = 0; i < reader->nsa; i++)
++		{
++			if((cta_res[1] == reader->sa[i][2]) && (cta_res[2] == reader->sa[i][1]) && (cta_res[3] == reader->sa[i][0]))
++			{
++				toadd = false;
++			}
++		}
++
++		if(toadd && (memcmp(cta_res + 1, "\x00\x00\x00", 3)))
++		{
++			reader->sa[reader->nsa][0] = cta_res[3];
++			reader->sa[reader->nsa][1] = cta_res[2];
++			reader->sa[reader->nsa][2] = cta_res[1];
++			reader->sa[reader->nsa][3] = 0;
++
++			reader->nsa += 1;
++		}
++	}
++}
++
++static void addSAseca(struct s_reader *reader, uint8_t *cta_res)
++{
++	if(cta_res[0] == 0x84)
++	{
++		addProvider(reader, cta_res + 1);
++
++		if(memcmp(cta_res + 3, "\x00\x00\x00", 3))
++		{
++			int i;
++			i = get_prov_index(reader, cta_res + 1);
++
++			memcpy(reader->sa[i], cta_res + 3, 3);
++		}
++	}
++}
++
++static void addemmfilter(struct s_reader *reader, uint8_t *cta_res)
++{
++	if(cta_res[0] == 0x82)
++	{
++		reader->emm82 = 1;
++	}
++	else if(cta_res[0] == 0x84)
++	{
++		int i;
++		bool toadd = true;
++
++		for(i = 0; i < reader->nemm84; i++)
++		{
++			if(!memcmp(cta_res, reader->emm84[i], 3))
++			{
++				toadd = false;
++			}
++		}
++
++		if(toadd && (memcmp(cta_res + 1, "\x00\x00", 2)))
++		{
++			reader->emm84[reader->nemm84][0] = cta_res[0];
++			reader->emm84[reader->nemm84][1] = cta_res[1];
++			reader->emm84[reader->nemm84][2] = cta_res[2];
++
++			reader->nemm84 += 1;
++		}
++	}
++	else if(cta_res[0] == 0x83 && cta_res[5] == 0x00)
++	{
++		int i;
++		bool toadd = true;
++
++		for(i = 0; i < reader->nemm83u; i++)
++		{
++			if(!memcmp(cta_res, reader->emm83u[i], 6))
++			{
++				toadd = false;
++			}
++		}
++
++		if(toadd && (memcmp(cta_res + 1, "\x00\x00\x00\x00", 4)))
++		{
++			memcpy(reader->emm83u[reader->nemm83u], cta_res, 6);
++
++			reader->nemm83u += 1;
++		}
++	}
++	else if(cta_res[0] == 0x83 && cta_res[5] == 0x10)
++	{
++		int i;
++		bool toadd = true;
++
++		if(reader->evensa)
++		{
++			unsigned long sax = (cta_res[3] << 16) + (cta_res[2] << 8) + (cta_res[1]);
++			if(sax % 2 != 0)
++			{
++				sax--;
++				cta_res[3]=(sax>>16)&0xFF;
++				cta_res[2]=(sax>>8)&0xFF;
++				cta_res[1]=(sax)&0xFF;
++			}
++		}
++
++		for(i = 0; i < reader->nemm83s; i++)
++		{
++			if(!memcmp(cta_res, reader->emm83s[i], 6))
++			{
++				toadd = false;
++			}
++		}
++
++		if(toadd && (memcmp(cta_res + 1, "\x00\x00\x00", 3)))
++		{
++			memcpy(reader->emm83s[reader->nemm83s], cta_res, 6);
++
++			reader->nemm83s += 1;
++		}
++	}
++	else if(cta_res[0] == 0x87)
++	{
++		int i;
++		bool toadd = true;
++
++		if(reader->evensa)
++		{
++			unsigned long sax = (cta_res[3] << 16) + (cta_res[2] << 8) + (cta_res[1]);
++			if(sax % 2 != 0)
++			{
++				sax--;
++				cta_res[3]=(sax>>16)&0xFF;
++				cta_res[2]=(sax>>8)&0xFF;
++				cta_res[1]=(sax)&0xFF;
++			}
++		}
++
++		for(i = 0; i < reader->nemm87; i++)
++		{
++			if(!memcmp(cta_res, reader->emm87[i], 6))
++			{
++				toadd = false;
++			}
++		}
++
++		if(toadd && (memcmp(cta_res + 1, "\x00\x00\x00", 3)))
++		{
++			memcpy(reader->emm87[reader->nemm87], cta_res, 6);
++
++			reader->nemm87 += 1;
++		}
++	}
++}
++
+ static int32_t ParseDataType(struct s_reader *reader, uint8_t dt, uint8_t *cta_res, uint16_t cta_lr)
+ {
+ 	char ds[11], de[11];
+@@ -95,7 +275,7 @@
+ 			reader->prid[1][1] = 0x00;
+ 			reader->prid[1][2] = 0x00;
+ 			reader->prid[1][3] = 0x00;
+-			memcpy(reader->sa[1], reader->sa[0], 0x04);
++
+ 			reader->nprov += 1;
+ 			reader->caid = (SYSTEM_NAGRA | cta_res[25]);
+ 			rdr_log_dbg(reader, D_READER, "CAID : %04X", reader->caid);
+@@ -108,33 +288,109 @@
+ 			{
+ 				uint32_t timestamp = b2i(0x04, cta_res + 22);
+ 				reader->card_valid_to = tier_date(timestamp, de, 11);
+-				rdr_log(reader, "Provider Sys ID: %02X %02X is active to: %s", cta_res[19], cta_res[20], de);
++			}
++			if(reader->protocol_type == ATR_PROTOCOL_TYPE_T0)
++			{
++				uint16_t chid = 0;
++				uint32_t id = b2i(0x02, cta_res + 19);
++				uint32_t start_date;
++				uint32_t expire_date;
++
++				start_date = 1;
++				expire_date = b2i(0x04, cta_res + 22);
++
++				cs_add_entitlement(reader,
++				reader->caid,
++				id,
++				chid,
++				0,
++				tier_date(start_date, ds, 11),
++				tier_date(expire_date, de, 11),
++				4,
++				1);
++				rdr_log(reader, "|%04X|%04X    |%s  |%s  |", id, chid, ds, de);
++				addProvider(reader, cta_res + 19);
++			}
++			return OK;
++		}
++
++		case 0x04:
++		{
++			if(cta_res[18] != 0x80)
++			{
++				addProvider(reader, cta_res + 19);
++
++				uint8_t check[] = {0x00, 0x01};
++				check[0] = reader->caid & 0xFF;
++				int p;
++
++				for(p=23; p < (cta_lr - 6); p++)
++				{
++					if(!memcmp(cta_res + p, check, 2))
++					{
++						addProvider(reader, cta_res + p + 2);
++
++						if(reader->cak7type == 3)
++						{
++							addSAseca(reader, cta_res + p + 5);
++						}
++						else
++						{
++							addSA(reader, cta_res + p + 5);
++							addemmfilter(reader, cta_res + p + 5);
++						}
++					}
++				}
+ 			}
+ 			return OK;
+ 		}
+ 
+ 		case SYSID: // case 0x05
+ 		{
+-			IDEA_KEY_SCHEDULE ks;
+ 			memcpy(reader->edata,cta_res + 26, 0x70);
+ 			reader->dt5num = cta_res[20];
+-			rsa_decrypt(reader->edata, 0x70, reader->out, reader->mod1, reader->mod1_length);
++			char tmp[8];
++			rdr_log(reader, "Card has DT05_%s", cs_hexdump(1, &reader->dt5num, 1, tmp, sizeof(tmp)));
+ 
+ 			if(reader->dt5num == 0x00)
+ 			{
++				IDEA_KEY_SCHEDULE ks;
++				rsa_decrypt(reader->edata, 0x70, reader->out, reader->mod1, reader->mod1_length);
+ 				memcpy(reader->kdt05_00,&reader->out[18], 0x5C + 2);
+ 				memcpy(&reader->kdt05_00[0x5C + 2], cta_res + 26 + 0x70, 6);
+ 				memcpy(reader->ideakey1, reader->out, 16);
++				rdr_log_dump_dbg(reader, D_READER, reader->ideakey1, 16, "IDEAKEY1: ");
+ 				memcpy(reader->block3, cta_res + 26 + 0x70 + 6, 8);
+ 				idea_set_encrypt_key(reader->ideakey1, &ks);
+ 				memset(reader->v, 0, sizeof(reader->v));
+ 				idea_cbc_encrypt(reader->block3, reader->iout, 8, &ks, reader->v, IDEA_DECRYPT);
+ 				memcpy(&reader->kdt05_00[0x5C + 2 + 6],reader->iout, 8);
++				uint8_t mdc_hash1[MDC2_DIGEST_LENGTH];
++				memset(mdc_hash1,0x00,MDC2_DIGEST_LENGTH);
++				uint8_t check1[0x7E];
++				memset(check1, 0x00, 0x7E);
++				memcpy(check1 + 18, reader->kdt05_00, 0x6C);
++				MDC2_CTX c1;
++				MDC2_Init(&c1);
++				MDC2_Update(&c1, check1, 0x7E);
++				MDC2_Final(&(mdc_hash1[0]), &c1);
++
++				rdr_log_dump_dbg(reader, D_READER, mdc_hash1, 16, "MDC_HASH: ");
++				if(memcmp(mdc_hash1 + 1, reader->ideakey1 + 1, 14) == 0)
++				{
++				rdr_log(reader, "DT05_00 is correct");
++				}
++				else
++				{
++				rdr_log(reader, "DT05_00 error - check MOD1");
++				}
+ 				rdr_log_dump_dbg(reader, D_READER, reader->kdt05_00, sizeof(reader->kdt05_00), "DT05_00: ");
+ 			}
+ 
+ 			if(reader->dt5num == 0x10)
+ 			{
++				IDEA_KEY_SCHEDULE ks;
++				rsa_decrypt(reader->edata, 0x70, reader->out, reader->mod1, reader->mod1_length);
+ 				memcpy(reader->kdt05_10, &reader->out[16], 6 * 16);
+ 				memcpy(reader->ideakey1, reader->out, 16);
+ 				memcpy(reader->block3, cta_res + 26 + 0x70, 8);
+@@ -144,6 +400,15 @@
+ 				memcpy(&reader->kdt05_10[6 * 16],reader->iout,8);
+ 				rdr_log_dump_dbg(reader, D_READER, reader->kdt05_10, sizeof(reader->kdt05_10), "DT05_10: ");
+ 			}
++
++			if(reader->dt5num == 0x20)
++			{
++				rsa_decrypt(reader->edata, 0x70, reader->out, reader->mod2, reader->mod2_length);
++				memcpy(reader->tmprsa, reader->out, 0x70);
++				reader->pairbyte = 0x40;
++				rdr_log(reader, "OSCam will try UNIQUE mode");
++			}
++
+ 			return OK;
+ 		}
+ 
+@@ -174,9 +439,14 @@
+ 						expire_date = expire_date1 <= expire_date2 ? expire_date1 : expire_date2;
+ 						break;
+ 
++					case 0x1861: // Polsat
++						start_date = 1;
++						expire_date = b2i(0x04, cta_res + 28);
++						break;
++
+ 					default: // unknown card
+ 						start_date = 1;
+-						expire_date = 0x569EFB7F;
++						expire_date = 0xA69EFB7F;
+ 				}
+ 
+ 				cs_add_entitlement(reader,
+@@ -189,7 +459,7 @@
+ 					4,
+ 					1);
+ 				rdr_log(reader, "|%04X|%04X    |%s  |%s  |", id, chid, ds, de);
+-				addProvider(reader, cta_res);
++				addProvider(reader, cta_res + 19);
+ 			}
+ 			return OK;
+ 		}
+@@ -228,6 +498,7 @@
+ 	while(1)
+ 	{
+ 		CAK7do_cmd(reader, dt, 0x10, cta_res, &cta_lr, sub, retlen);
++		rdr_log_dump_dbg(reader, D_READER, cta_res, cta_lr, "RAW Answer:");
+ 		// hier eigentlich check auf 90 am ende usw... obs halt klarging ...
+ 
+ 		uint32_t newsub = (cta_res[9] << 16) + (cta_res[10] << 8) + (cta_res[11]);
+@@ -262,7 +533,7 @@
+ 	return OK;
+ }
+ 
+-void sub_6AD78(uint32_t *dinit) // gbox function
++static void sub_6AD78(uint32_t *dinit) // gbox function
+ {
+ 	uint32_t v0 = (uint32_t) * dinit;
+ 	double f0;
+@@ -275,7 +546,7 @@
+ 	*dinit = v12;
+ }
+ 
+-void calc_cak7_exponent(uint32_t *dinit, uint8_t *out, uint8_t len)
++static void calc_cak7_exponent(uint32_t *dinit, uint8_t *out, uint8_t len)
+ {
+ 	memset(out, 0x00, len);
+ 
+@@ -316,62 +587,243 @@
+ 
+ }
+ 
+-void CAK7_getCamKey(struct s_reader *reader)
++static void IdeaDecrypt(unsigned char *data, int len, const unsigned char *key, unsigned char *iv)
+ {
+-	def_resp;
+-	uint8_t cmd0e[] = {0xCC,0xCC,0xCC,0xCC,0x00,0x00,0x09,0x0E,0x83,0x00,0x00,0x00,0x00,0x00,0x64,0x65,0x6D,0x6F,0x34,0x11,0x9D,
+-	0x7E,0xEE,0xCE,0x53,0x09,0x80,0xAE,0x6B,0x5A,0xEE,0x3A,0x41,0xCE,0x09,0x75,0xEF,0xA6,0xBF,0x1E,0x98,0x4F,
+-	0xA4,0x11,0x6F,0x43,0xCA,0xCD,0xD0,0x6E,0x69,0xFA,0x25,0xC1,0xF9,0x11,0x8E,0x7A,0xD0,0x19,0xC0,0xEB,0x00,
+-	0xC0,0x57,0x2A,0x40,0xB7,0xFF,0x8A,0xBB,0x25,0x21,0xD7,0x50,0xE7,0x35,0xA1,0x85,0xCD,0xA6,0xD3,0xDE,0xB3,
+-	0x3D,0x16,0xD4,0x94,0x76,0x8A,0x82,0x8C,0x70,0x25,0xD4,0x00,0xD0,0x64,0x8C,0x26,0xB9,0x5F,0x44,0xFF,0x73,
+-	0x70,0xAB,0x43,0xF5,0x68,0xA2,0xB1,0xB5,0x8A,0x8E,0x02,0x5F,0x96,0x06,0xA8,0xC3,0x4F,0x15,0xCD,0x99,0xC2,
+-	0x69,0xB8,0x35,0x68,0x11,0x4C,0x00,0x00,0x00,0x00,0x00,0x08,0x00,0x00,0xCC,0xCC,0xCC,0xCC};
++unsigned char v[8];
++if(!iv) { memset(v,0,sizeof(v)); iv=v; }
++IDEA_KEY_SCHEDULE ks;
++idea_set_encrypt_key(key,&ks);
++idea_cbc_encrypt(data,data,len&~7,&ks,iv,IDEA_DECRYPT);
++}
+ 
+-	if (reader->nuid_length == 4)
++static inline void xxxor(uint8_t *data, int32_t len, const uint8_t *v1, const uint8_t *v2)
++{
++	uint32_t i;
++	switch(len)
+ 	{
+-		memcpy(cmd0e + 132, reader->nuid, reader->nuid_length); // inject NUID
++	case 16:
++		for(i = 0; i < 16; ++i)
++		{
++			data[i] = v1[i] ^ v2[i];
++		}
++		break;
++	case 8:
++		for(i = 0; i < 8; ++i)
++		{
++			data[i] = v1[i] ^ v2[i];
++		}
++		break;
++	case 4:
++		for(i = 0; i < 4; ++i)
++		{
++			data[i] = v1[i] ^ v2[i];
++		}
++		break;
++	default:
++		while(len--)
++		{
++			*data++ = *v1++ ^ *v2++;
++		}
++		break;
+ 	}
++}
+ 
+-	do_cak7_cmd(reader,cta_res, &cta_lr, cmd0e, sizeof(cmd0e), 0x20);
+-	reader->dword_83DBC =  (cta_res[18] << 24);
+-	reader->dword_83DBC += (cta_res[19] << 16);
+-	reader->dword_83DBC += (cta_res[20] <<  8);
+-	reader->dword_83DBC += (cta_res[21]      );
+-	calc_cak7_exponent(&reader->dword_83DBC, reader->cak7expo, 0x11);
+-	memcpy(reader->cardid,cta_res + 14, 4);
+-	rdr_log_dump_dbg(reader, D_READER, reader->cardid, 0x04, "CardSerial: ");
+-	memcpy(reader->hexserial + 2, reader->cardid, 4);
+-	memcpy(reader->sa[0], reader->cardid, 3);
+-	memcpy(reader->sa[1], reader->sa[0], 4);
+-	unsigned long datal = (cta_res[9] << 24) + (cta_res[10] << 16) + (cta_res[11] << 8) + (cta_res[12]);
+-	datal++;
+-	reader->data2[0] = (datal >> 24) & 0xFF;
+-	reader->data2[1] = (datal >> 16) & 0xFF;
+-	reader->data2[2] = (datal >>  8) & 0xFF;
+-	reader->data2[3] = (datal      ) & 0xFF;
++static void CreateRSAPair60(struct s_reader *reader, const unsigned char *key)
++{
++unsigned char idata[96];
++int i;
++for(i=11; i>=0; i--) {
++unsigned char *d=&idata[i*8];
++memcpy(d,&key[13],8);
++*d^=i;
++IdeaDecrypt(d,8,key,0);
++xxxor(d,8,d,&key[13]);
++*d^=i;
++}
++BN_CTX *ctx5 = BN_CTX_new();
++#ifdef WITH_LIBCRYPTO
++BN_CTX_start(ctx5);
++#endif
++BIGNUM *p = BN_CTX_get(ctx5);
++BIGNUM *q = BN_CTX_get(ctx5);
++BIGNUM *m = BN_CTX_get(ctx5);
++BIGNUM *e = BN_CTX_get(ctx5);
++BIGNUM *a = BN_CTX_get(ctx5);
++BIGNUM *r = BN_CTX_get(ctx5);
++
++// Calculate P
++idata[0] |= 0x80;
++idata[47] |= 1;
++BN_bin2bn(idata,48,p);
++BN_add_word(p,(key[21] << 5 ) | ((key[22] & 0xf0) >> 3));
++// Calculate Q
++idata[48] |= 0x80;
++idata[95] |= 1;
++BN_bin2bn(idata+48,48,q);
++BN_add_word(q,((key[22]&0xf)<<9) | (key[23]<<1));
++
++// Calculate M=P*Q
++BN_mul(m,p,q,ctx5);
++memset(reader->key60,0x00,0x60);
++BN_bn2bin(m, reader->key60 + (0x60 - BN_num_bytes(m)));
++rdr_log_dump_dbg(reader, D_READER, reader->key60, sizeof(reader->key60), "key60: ");
++
++// Calculate D
++BN_sub_word(p,1);
++BN_sub_word(q,1);
++BN_mul(e,p,q,ctx5);
++BN_bin2bn(public_exponent,3,a);
++BN_mod_inverse(r, a, e, ctx5);
++memset(reader->exp60,0x00,0x60);
++BN_bn2bin(r, reader->exp60 + (0x60 - BN_num_bytes(r)));
++rdr_log_dump_dbg(reader, D_READER, reader->exp60, sizeof(reader->exp60), "exp60: ");
+ 
+-	BN_CTX *ctx0 = BN_CTX_new();
++BN_CTX_end(ctx5);
++BN_CTX_free(ctx5);
++}
++
++static void CreateRSAPair68(struct s_reader *reader, const unsigned char *key)
++{
++unsigned char idata[104];
++int i;
++for(i=12; i>=0; i--) {
++unsigned char *d=&idata[i*8];
++memcpy(d,&key[13],8);
++*d^=i;
++IdeaDecrypt(d,8,key,0);
++xxxor(d,8,d,&key[13]);
++*d^=i;
++}
++BN_CTX *ctx6 = BN_CTX_new();
+ #ifdef WITH_LIBCRYPTO
+-	BN_CTX_start(ctx0);
++BN_CTX_start(ctx6);
+ #endif
+-	BIGNUM *bnN0 = BN_CTX_get(ctx0);
+-	BIGNUM *bnE0 = BN_CTX_get(ctx0);
+-	BIGNUM *bnCT0 = BN_CTX_get(ctx0);
+-	BIGNUM *bnPT0 = BN_CTX_get(ctx0);
+-	BN_bin2bn(&reader->mod50[0], 0x50, bnN0);
+-	BN_bin2bn(&reader->cak7expo[0], 0x11, bnE0);
+-	BN_bin2bn(&reader->data50[0], 0x50, bnCT0);
+-	BN_mod_exp(bnPT0, bnCT0, bnE0, bnN0, ctx0);
+-	memset(reader->data, 0x00, sizeof(reader->data));
+-	BN_bn2bin(bnPT0, reader->data + (0x50 - BN_num_bytes(bnPT0)));
+-	BN_CTX_end(ctx0);
+-	BN_CTX_free(ctx0);
++BIGNUM *p = BN_CTX_get(ctx6);
++BIGNUM *q = BN_CTX_get(ctx6);
++BIGNUM *m = BN_CTX_get(ctx6);
++BIGNUM *e = BN_CTX_get(ctx6);
++BIGNUM *a = BN_CTX_get(ctx6);
++BIGNUM *r = BN_CTX_get(ctx6);
++
++// Calculate P
++idata[0] |= 0x80;
++idata[51] |= 1;
++BN_bin2bn(idata,52,p);
++BN_add_word(p,(key[21] << 5 ) | ((key[22] & 0xf0) >> 3));
++// Calculate Q
++idata[52] |= 0x80;
++idata[103] |= 1;
++BN_bin2bn(idata+52,52,q);
++BN_add_word(q,((key[22]&0xf)<<9) | (key[23]<<1));
++
++// Calculate M=P*Q
++BN_mul(m,p,q,ctx6);
++memset(reader->key68,0x00,0x68);
++BN_bn2bin(m, reader->key68 + (0x68 - BN_num_bytes(m)));
++rdr_log_dump_dbg(reader, D_READER, reader->key68, sizeof(reader->key68), "key68: ");
++
++// Calculate D
++BN_sub_word(p,1);
++BN_sub_word(q,1);
++BN_mul(e,p,q,ctx6);
++BN_bin2bn(public_exponent,3,a);
++BN_mod_inverse(r, a, e, ctx6);
++memset(reader->exp68,0x00,0x68);
++BN_bn2bin(r, reader->exp68 + (0x68 - BN_num_bytes(r)));
++rdr_log_dump_dbg(reader, D_READER, reader->exp68, sizeof(reader->exp68), "exp68: ");
+ 
+-	memcpy(&reader->step1[0], d00ff, 4);
+-	memcpy(&reader->step1[4], reader->data, 0x50);
+-	memcpy(&reader->step1[4 + 0x50], irdid, 0x04);
+-	memcpy(&reader->step1[4 + 4 + 0x50], data1, 0x04);
+-	memcpy(&reader->step1[4 + 4 + 4 + 0x50], reader->data2, 0x04);
++BN_CTX_end(ctx6);
++BN_CTX_free(ctx6);
++}
++
++static void dt05_20(struct s_reader *reader)
++{
++	uint8_t data_20_00[72];
++	uint8_t sig_20_00[16];
++	uint8_t data_20_id[72];
++	uint8_t data_20_x[64];
++	uint8_t data_20_fin[72];
++	uint8_t data_20_flag58[16];
++
++	rdr_log_dump_dbg(reader, D_READER, reader->tmprsa, sizeof(reader->tmprsa), "DT05_20 after RSA: ");
++
++	// copy signature
++	memcpy(sig_20_00, reader->tmprsa+24, 16);
++
++	// copy data
++	memcpy(data_20_00, reader->tmprsa+40, 72);
++
++	// IDEA encrypt 0x48 data
++	int i;
++	int offs = 0;
++
++	for(i=0; i<9; i++)
++	{
++		IDEA_KEY_SCHEDULE ks;
++		idea_set_encrypt_key(reader->key3310, &ks);
++		idea_ecb_encrypt(data_20_00+offs, data_20_id+offs, &ks);
++		offs+=8;
++	}
++
++	// xor
++	for (i=0; i<64; i++)
++	{
++		data_20_x[i] = data_20_00[i] ^ data_20_id[i+8];
++	}
++
++	rdr_log_dump_dbg(reader, D_READER, data_20_x, sizeof(data_20_x), "data_20_x: ");
++
++	// create final data block
++	memcpy(data_20_fin,data_20_id,8);
++	memcpy(data_20_fin+8,data_20_x,64);
++
++	rdr_log_dump_dbg(reader, D_READER, data_20_fin, sizeof(data_20_fin), "data_20_fin: ");
++
++	uint8_t mdc_hash4[MDC2_DIGEST_LENGTH];
++	memset(mdc_hash4,0x00,MDC2_DIGEST_LENGTH);
++	uint8_t check4[112];
++	memset(check4, 0x00, 112);
++	memcpy(check4, reader->cardid, 4);
++	memcpy(check4 + 4, reader->idird, 4);
++	memcpy(check4 + 23, reader->tmprsa + 23, 1);
++	memcpy(check4 + 40, data_20_fin, 72);
++	MDC2_CTX c4;
++	MDC2_Init(&c4);
++	MDC2_Update(&c4, check4, 112);
++	MDC2_Final(&(mdc_hash4[0]), &c4);
++
++	if(memcmp(mdc_hash4, sig_20_00, 16) == 0)
++	{
++	rdr_log(reader, "DT05_20 is correct");
++	}
++	else
++	{
++	rdr_log(reader, "DT05_20 error - check MOD2");
++	}
++
++	// Store 3des software key Flag58 CW overencrypt
++	memcpy(data_20_flag58, data_20_x+16, 16);
++	memcpy(reader->key3des, data_20_flag58, 16);
++
++	rdr_log_dump_dbg(reader, D_READER, reader->key3des, sizeof(reader->key3des), "Flag58 3DES Key: ");
++
++	// create rsa pair from final data
++
++	memcpy(reader->klucz68, data_20_fin, 0x18);
++
++	rdr_log_dump_dbg(reader, D_READER, reader->klucz68, sizeof(reader->klucz68), "klucz68: ");
++}
++
++static int32_t CAK7_cmd03_global(struct s_reader *reader)
++{
++	def_resp;
++	if(reader->cak7_seq <= 15)
++	{
++		unsigned char klucz[24];
++		memset(klucz, 0x00, 24);
++		memcpy(klucz, reader->key3588, 24);
++		CreateRSAPair60(reader, klucz);
++	}
+ 
+ 	BN_CTX *ctx1 = BN_CTX_new();
+ #ifdef WITH_LIBCRYPTO
+@@ -385,6 +837,7 @@
+ 	BN_bin2bn(&reader->exp60[0], 0x60, bnE1);
+ 	BN_bin2bn(&reader->step1[0], 0x60, bnCT1);
+ 	BN_mod_exp(bnPT1, bnCT1, bnE1, bnN1, ctx1);
++	memset(reader->data, 0x00, sizeof(reader->data));
+ 	BN_bn2bin(bnPT1, reader->data + (0x60 - BN_num_bytes(bnPT1)));
+ 	BN_CTX_end(ctx1);
+ 	BN_CTX_free(ctx1);
+@@ -392,6 +845,7 @@
+ 	memcpy(&reader->step2[0], d00ff, 4);
+ 	memcpy(&reader->step2[4], reader->cardid, 4);
+ 	memcpy(&reader->step2[8], reader->data, 0x60);
++	rdr_log_dump_dbg(reader, D_READER, reader->step2, sizeof(reader->step2), "STEP 2:");
+ 
+ 	BN_CTX *ctx2 = BN_CTX_new();
+ #ifdef WITH_LIBCRYPTO
+@@ -405,12 +859,14 @@
+ 	BN_bin2bn(public_exponent, 3, bnE2);
+ 	BN_bin2bn(&reader->step2[0], 0x68, bnCT2);
+ 	BN_mod_exp(bnPT2, bnCT2, bnE2, bnN2, ctx2);
++	memset(reader->data, 0x00, sizeof(reader->data));
+ 	BN_bn2bin(bnPT2, reader->data + (0x68 - BN_num_bytes(bnPT2)));
+ 	BN_CTX_end(ctx2);
+ 	BN_CTX_free(ctx2);
+ 
+ 	memcpy(&reader->step3[0], d00ff, 4);
+ 	memcpy(&reader->step3[4], reader->data, 0x68);
++	rdr_log_dump_dbg(reader, D_READER, reader->step3, sizeof(reader->step3), "STEP 3:");
+ 
+ 	BN_CTX *ctx3 = BN_CTX_new();
+ #ifdef WITH_LIBCRYPTO
+@@ -424,11 +880,12 @@
+ 	BN_bin2bn(public_exponent, 3, bnE3);
+ 	BN_bin2bn(&reader->step3[0], 0x6c, bnCT3);
+ 	BN_mod_exp(bnPT3, bnCT3, bnE3, bnN3, ctx3);
++	memset(reader->data, 0x00, sizeof(reader->data));
+ 	BN_bn2bin(bnPT3, reader->data + (0x6c - BN_num_bytes(bnPT3)));
+ 	BN_CTX_end(ctx3);
+ 	BN_CTX_free(ctx3);
+ 
+-	uint8_t cmd03[] = {0xCC,0xCC,0xCC,0xCC, 0x00,0x00,0x0A,0x03,0x6C,
++	uint8_t cmd03[] = {0xCC,0xCC,0xCC,0xCC,0x00,0x00,0x0A,0x03,0x6C,
+ 	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
+ 	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
+ 	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
+@@ -436,10 +893,19 @@
+ 	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
+ 	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
+ 	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
+-	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC };
++	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC};
+ 
+ 	memcpy(&cmd03[9],reader->data,0x6c);
++
+ 	do_cak7_cmd(reader,cta_res,&cta_lr,cmd03,sizeof(cmd03),0x90);
++
++	if(cta_lr == 0)
++	{
++		rdr_log(reader, "card is not responding to CMD03 - check your data");
++		return ERROR;
++	}
++
++	rdr_log_dump_dbg(reader, D_READER, cta_res, 0x90, "CMD03 ANSWER:");
+ 	memcpy(reader->encrypted,&cta_res[10],0x68);
+ 
+ 	BN_CTX *ctx = BN_CTX_new();
+@@ -475,58 +941,399 @@
+ 	BN_bin2bn(&reader->cak7expo[0], 0x11, bnEs);
+ 	BN_bin2bn(&reader->stillencrypted[0], 0x50, bnCTs);
+ 	BN_mod_exp(bnPTs, bnCTs, bnEs, bnNs, ctxs);
++	memset(reader->resultrsa, 0x00, 0x50);
+ 	BN_bn2bin(bnPTs, reader->resultrsa + (0x50 - BN_num_bytes(bnPTs)));
+ 	BN_CTX_end(ctxs);
+ 	BN_CTX_free(ctxs);
+ 
+-	uint8_t mdc_hash[MDC2_DIGEST_LENGTH];
+-	memset(mdc_hash,0x00,MDC2_DIGEST_LENGTH);
+-	MDC2_CTX c;
+-	MDC2_Init(&c);
+-	MDC2_Update(&c, reader->resultrsa, sizeof(reader->resultrsa));
+-	MDC2_Final(&(mdc_hash[0]), &c);
++	uint8_t mdc_hash3[MDC2_DIGEST_LENGTH];
++	memset(mdc_hash3,0x00,MDC2_DIGEST_LENGTH);
++	MDC2_CTX c3;
++	MDC2_Init(&c3);
++	MDC2_Update(&c3, reader->resultrsa, sizeof(reader->resultrsa));
++	MDC2_Final(&(mdc_hash3[0]), &c3);
++
++	memcpy(&reader->cak7_aes_key[16],mdc_hash3,16);
++	memcpy(reader->cak7_aes_key,mdc_hash3,16);
+ 
+-	memcpy(&reader->cak7_aes_key[16],mdc_hash,16);
+-	memcpy(reader->cak7_aes_key,mdc_hash,16);
++	char tmp7[128];
++	rdr_log(reader, "New AES: %s", cs_hexdump(1, reader->cak7_aes_key, 16, tmp7, sizeof(tmp7)));
++
++	return OK;
+ }
+ 
+-static int32_t nagra3_card_init(struct s_reader *reader, ATR *newatr)
++static int32_t CAK7_cmd03_unique(struct s_reader *reader)
+ {
+-	get_atr;
++	def_resp;
++	BN_CTX *ctx1 = BN_CTX_new();
++#ifdef WITH_LIBCRYPTO
++	BN_CTX_start(ctx1);
++#endif
++	BIGNUM *bnN1 = BN_CTX_get(ctx1);
++	BIGNUM *bnE1 = BN_CTX_get(ctx1);
++	BIGNUM *bnCT1 = BN_CTX_get(ctx1);
++	BIGNUM *bnPT1 = BN_CTX_get(ctx1);
++	BN_bin2bn(&reader->key3460[0], 0x60, bnN1);
++	BN_bin2bn(public_exponent, 3, bnE1);
++	BN_bin2bn(&reader->step1[0], 0x60, bnCT1);
++	BN_mod_exp(bnPT1, bnCT1, bnE1, bnN1, ctx1);
++	memset(reader->data, 0x00, sizeof(reader->data));
++	BN_bn2bin(bnPT1, reader->data + (0x60 - BN_num_bytes(bnPT1)));
++	BN_CTX_end(ctx1);
++	BN_CTX_free(ctx1);
+ 
+-	memset(reader->hexserial, 0x00, 0x08);
+-	reader->cak7_seq = 0;
+-	cs_clear_entitlement(reader);
++	memcpy(&reader->step2[0], d00ff, 4);
++	memcpy(&reader->step2[4], reader->cardid, 4);
++	memcpy(&reader->step2[8], reader->data, 0x60);
++	rdr_log_dump_dbg(reader, D_READER, reader->step2, sizeof(reader->step2), "STEP 2:");
+ 
+-	if(memcmp(atr + 11, "DNASP4", 6) == 0)
++	if(reader->cak7_seq <= 15)
+ 	{
+-		memcpy(reader->rom, atr + 11, 15);
+-		rdr_log(reader,"Rom revision: %.15s", reader->rom);
++		dt05_20(reader);
++		CreateRSAPair68(reader, reader->klucz68);
++	}
++
++	BN_CTX *ctx2 = BN_CTX_new();
++#ifdef WITH_LIBCRYPTO
++	BN_CTX_start(ctx2);
++#endif
++	BIGNUM *bnN2 = BN_CTX_get(ctx2);
++	BIGNUM *bnE2 = BN_CTX_get(ctx2);
++	BIGNUM *bnCT2 = BN_CTX_get(ctx2);
++	BIGNUM *bnPT2 = BN_CTX_get(ctx2);
++	BN_bin2bn(&reader->key68[0], 0x68, bnN2);
++	BN_bin2bn(&reader->exp68[0], 0x68, bnE2);
++	BN_bin2bn(&reader->step2[0], 0x68, bnCT2);
++	BN_mod_exp(bnPT2, bnCT2, bnE2, bnN2, ctx2);
++	memset(reader->data, 0x00, sizeof(reader->data));
++	BN_bn2bin(bnPT2, reader->data + (0x68 - BN_num_bytes(bnPT2)));
++	BN_CTX_end(ctx2);
++	BN_CTX_free(ctx2);
++
++	memcpy(&reader->step3[0], d00ff, 4);
++	memcpy(&reader->step3[4], reader->data, 0x68);
++	rdr_log_dump_dbg(reader, D_READER, reader->step3, sizeof(reader->step3), "STEP 3:");
++
++	BN_CTX *ctx3 = BN_CTX_new();
++#ifdef WITH_LIBCRYPTO
++	BN_CTX_start(ctx3);
++#endif
++	BIGNUM *bnN3 = BN_CTX_get(ctx3);
++	BIGNUM *bnE3 = BN_CTX_get(ctx3);
++	BIGNUM *bnCT3 = BN_CTX_get(ctx3);
++	BIGNUM *bnPT3 = BN_CTX_get(ctx3);
++	BN_bin2bn(&reader->kdt05_00[0], 0x6c, bnN3);
++	BN_bin2bn(public_exponent, 3, bnE3);
++	BN_bin2bn(&reader->step3[0], 0x6c, bnCT3);
++	BN_mod_exp(bnPT3, bnCT3, bnE3, bnN3, ctx3);
++	memset(reader->data, 0x00, sizeof(reader->data));
++	BN_bn2bin(bnPT3, reader->data + (0x6c - BN_num_bytes(bnPT3)));
++	BN_CTX_end(ctx3);
++	BN_CTX_free(ctx3);
++
++	uint8_t cmd03[] = {0xCC,0xCC,0xCC,0xCC,0x00,0x00,0x0A,0x03,0x6C,
++	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
++	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
++	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
++	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
++	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
++	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
++	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
++	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC};
++
++	memcpy(&cmd03[9],reader->data,0x6c);
++
++	do_cak7_cmd(reader,cta_res,&cta_lr,cmd03,sizeof(cmd03),0x90);
++
++	if(cta_lr == 0)
++	{
++		rdr_log(reader, "card is not responding to CMD03 - check your data");
++		return ERROR;
++	}
++
++	rdr_log_dump_dbg(reader, D_READER, cta_res, 0x90, "CMD03 ANSWER:");
++	memcpy(reader->encrypted,&cta_res[18],0x60);
++
++	BN_CTX *ctx = BN_CTX_new();
++#ifdef WITH_LIBCRYPTO
++	BN_CTX_start(ctx);
++#endif
++	BIGNUM *bnN = BN_CTX_get(ctx);
++	BIGNUM *bnE = BN_CTX_get(ctx);
++	BIGNUM *bnCT = BN_CTX_get(ctx);
++	BIGNUM *bnPT = BN_CTX_get(ctx);
++	BN_bin2bn(&reader->key3460[0], 96, bnN);
++	BN_bin2bn(public_exponent, 3, bnE);
++	BN_bin2bn(&reader->encrypted[0], 96, bnCT);
++	BN_mod_exp(bnPT, bnCT, bnE, bnN, ctx);
++	memset(reader->result, 0, 96);
++	BN_bn2bin(bnPT, reader->result + (96 - BN_num_bytes(bnPT)));
++	BN_CTX_end(ctx);
++	BN_CTX_free(ctx);
++
++	rdr_log_dump_dbg(reader, D_READER, reader->result, 96, "after RSA_3460: ");
++
++	//uint8_t stillencrypted[0x50];
++	memcpy(reader->stillencrypted,&reader->result[4],0x50);
++
++	//uint8_t resultrsa[0x50];
++	BN_CTX *ctxs = BN_CTX_new();
++#ifdef WITH_LIBCRYPTO
++	BN_CTX_start(ctxs);
++#endif
++	BIGNUM *bnNs  = BN_CTX_get(ctxs);
++	BIGNUM *bnEs  = BN_CTX_get(ctxs);
++	BIGNUM *bnCTs = BN_CTX_get(ctxs);
++	BIGNUM *bnPTs = BN_CTX_get(ctxs);
++	BN_bin2bn(&reader->mod50[0], reader->mod50_length, bnNs);
++	BN_bin2bn(&reader->cak7expo[0], 0x11, bnEs);
++	BN_bin2bn(&reader->stillencrypted[0], 0x50, bnCTs);
++	BN_mod_exp(bnPTs, bnCTs, bnEs, bnNs, ctxs);
++	memset(reader->resultrsa, 0x00, 0x50);
++	BN_bn2bin(bnPTs, reader->resultrsa + (0x50 - BN_num_bytes(bnPTs)));
++	BN_CTX_end(ctxs);
++	BN_CTX_free(ctxs);
++
++	uint8_t mdc_hash5[MDC2_DIGEST_LENGTH];
++	memset(mdc_hash5,0x00,MDC2_DIGEST_LENGTH);
++	MDC2_CTX c5;
++	MDC2_Init(&c5);
++	MDC2_Update(&c5, reader->resultrsa, sizeof(reader->resultrsa));
++	MDC2_Final(&(mdc_hash5[0]), &c5);
++
++	memcpy(&reader->cak7_aes_key[16],mdc_hash5,16);
++	memcpy(reader->cak7_aes_key,mdc_hash5,16);
++
++	char tmp7[128];
++	rdr_log(reader, "New AES: %s", cs_hexdump(1, reader->cak7_aes_key, 16, tmp7, sizeof(tmp7)));
++
++	return OK;
++}
++
++static int32_t CAK7_GetCamKey(struct s_reader *reader)
++{
++	def_resp;
++	uint8_t cmd0e[] = {0xCC,0xCC,0xCC,0xCC,0x00,0x00,0x00,0x0E,0x83,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xCC,
++	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
++	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
++	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
++	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
++	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
++	0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0x00,0x00,0x00,0x00,0x00,0x08,0x00,0x00,0xCC,0xCC,0xCC,0xCC};
++
++	if(!reader->nuid_length)
++	{
++		uint8_t cmd021[] = {0x02,0x7B};
++		uint8_t cmd022[] = {0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC};
++
++		memcpy(cmd0e + 7, cmd021, 2);
++		memcpy(cmd0e + 132, cmd022, 8);
++
++		rdr_log(reader, "using CMD02");
+ 	}
+ 	else
+ 	{
++		memcpy(cmd0e + 132, reader->nuid, reader->nuid_length); // inject NUID
++	}
++
++	memcpy(cmd0e + 13, &reader->pairbyte, 1);
++	memcpy(cmd0e + 14, reader->idird, 4);
++	if(reader->cmd0eprov_length)
++	{
++		memcpy(cmd0e + 18, reader->cmd0eprov, 2);
++	}
++	else
++	{
++		memcpy(cmd0e + 18, reader->prid[0] + 2, 2);
++	}
++	memcpy(cmd0e + 20, reader->key3588 + 24, 0x70);
++
++	if(reader->cak7_seq <= 15)
++	{
++		srand(time(NULL));
++	}
++	uint32_t data1r = rand() % 4294967294;
++
++	reader->timestmp1[0]=(data1r>>24)&0xFF;
++	reader->timestmp1[1]=(data1r>>16)&0xFF;
++	reader->timestmp1[2]=(data1r>>8)&0xFF;
++	reader->timestmp1[3]=(data1r)&0xFF;
++
++	memcpy(cmd0e + 9, reader->timestmp1, 0x04);
++
++	rdr_log_dump_dbg(reader, D_READER, reader->timestmp1, 4, "DATA1  CMD0E:");
++	rdr_log_dump_dbg(reader, D_READER, reader->prid[0], 4, "SysID:");
++
++	do_cak7_cmd(reader,cta_res, &cta_lr, cmd0e, sizeof(cmd0e), 0x20);
++
++	if(cta_lr == 0)
++	{
++		rdr_log(reader, "card is not responding to CMD02/E - check your data");
+ 		return ERROR;
+ 	}
+ 
+-	// check the completeness of the required CAK7 keys
+-	if(reader->mod1_length && reader->data50_length && reader->mod50_length && reader->key60_length && reader->exp60_length && reader->nuid_length)
++	reader->dword_83DBC =  (cta_res[18] << 24);
++	reader->dword_83DBC += (cta_res[19] << 16);
++	reader->dword_83DBC += (cta_res[20] <<  8);
++	reader->dword_83DBC += (cta_res[21]      );
++	calc_cak7_exponent(&reader->dword_83DBC, reader->cak7expo, 0x11);
++	rdr_log_dump_dbg(reader, D_READER, reader->cak7expo, 0x11, "CAK7 Exponent:");
++	memcpy(reader->cardid,cta_res + 14, 4);
++	rdr_log_dump_dbg(reader, D_READER, reader->cardid, 0x04, "CardSerial: ");
++	memcpy(reader->hexserial + 2, reader->cardid, 4);
++	unsigned long datal = (cta_res[9] << 24) + (cta_res[10] << 16) + (cta_res[11] << 8) + (cta_res[12]);
++	datal++;
++	reader->data2[0] = (datal >> 24) & 0xFF;
++	reader->data2[1] = (datal >> 16) & 0xFF;
++	reader->data2[2] = (datal >>  8) & 0xFF;
++	reader->data2[3] = (datal      ) & 0xFF;
++
++	data1r++;
++	reader->timestmp2[0]=(data1r>>24)&0xFF;
++	reader->timestmp2[1]=(data1r>>16)&0xFF;
++	reader->timestmp2[2]=(data1r>>8)&0xFF;
++	reader->timestmp2[3]=(data1r)&0xFF;
++
++	memcpy(reader->ecmheader,cta_res + 18,4);
++
++	if(reader->cak7_seq <= 15)
+ 	{
+-		rdr_log_dbg(reader, D_READER, "All parameters are set.");
++		uint8_t mdc_hash2[MDC2_DIGEST_LENGTH];
++		memset(mdc_hash2,0x00,MDC2_DIGEST_LENGTH);
++		uint8_t check2[0x78];
++		memset(check2, 0x00, 0x78);
++		memcpy(check2, reader->cardid, 4);
++		memcpy(check2 + 16, reader->kdt05_10, 0x68);
++		MDC2_CTX c2;
++		MDC2_Init(&c2);
++		MDC2_Update(&c2, check2, 0x78);
++		MDC2_Final(&(mdc_hash2[0]), &c2);
++
++		rdr_log_dump_dbg(reader, D_READER, reader->ideakey1, 16, "IDEAKEY1: ");
++		rdr_log_dump_dbg(reader, D_READER, mdc_hash2, 16, "MDC_HASH: ");
++		if(memcmp(mdc_hash2 + 1, reader->ideakey1 + 1, 14) == 0)
++		{
++		rdr_log(reader, "DT05_10 is correct");
++		}
++		else
++		{
++		rdr_log(reader, "DT05_10 error - check MOD1");
++		}
++	}
++
++	BN_CTX *ctx0 = BN_CTX_new();
++#ifdef WITH_LIBCRYPTO
++	BN_CTX_start(ctx0);
++#endif
++	BIGNUM *bnN0 = BN_CTX_get(ctx0);
++	BIGNUM *bnE0 = BN_CTX_get(ctx0);
++	BIGNUM *bnCT0 = BN_CTX_get(ctx0);
++	BIGNUM *bnPT0 = BN_CTX_get(ctx0);
++	BN_bin2bn(&reader->mod50[0], 0x50, bnN0);
++	BN_bin2bn(&reader->cak7expo[0], 0x11, bnE0);
++	BN_bin2bn(&reader->data50[0], 0x50, bnCT0);
++	BN_mod_exp(bnPT0, bnCT0, bnE0, bnN0, ctx0);
++	memset(reader->data, 0x00, sizeof(reader->data));
++	BN_bn2bin(bnPT0, reader->data + (0x50 - BN_num_bytes(bnPT0)));
++	BN_CTX_end(ctx0);
++	BN_CTX_free(ctx0);
++
++	rdr_log_dump_dbg(reader, D_READER, reader->timestmp2, 4, "DATA1  CMD03:");
++
++	memcpy(&reader->step1[0], d00ff, 4);
++	memcpy(&reader->step1[4], reader->data, 0x50);
++	memcpy(&reader->step1[4 + 0x50], reader->idird, 0x04);
++	memcpy(&reader->step1[4 + 4 + 0x50], reader->timestmp2, 0x04);
++	memcpy(&reader->step1[4 + 4 + 4 + 0x50], reader->data2, 0x04);
++	rdr_log_dump_dbg(reader, D_READER, reader->step1, sizeof(reader->step1), "STEP 1:");
++
++	reader->pairtype = cta_res[13];
++
++	if((reader->pairtype == 0x40 || reader->pairtype == 0x80) && reader->pairbyte == 0x40)
++	{
++		rdr_log(reader,"Despite DT05_20 card is starting in GLOBAL mode - check IRD & key3588");
++		if(!CAK7_cmd03_global(reader))
++		{return ERROR;}
++	}
++	else if((reader->pairtype == 0x40 || reader->pairtype == 0x80) && reader->pairbyte == 0x00)
++	{
++		rdr_log(reader,"Card is starting in GLOBAL mode");
++		if(!CAK7_cmd03_global(reader))
++		{return ERROR;}
++	}
++	else if(reader->pairtype == 0xC0)
++	{
++		rdr_log(reader,"Card is starting in UNIQUE mode");
++		if(!CAK7_cmd03_unique(reader))
++		{return ERROR;}
+ 	}
+ 	else
+ 	{
+-		rdr_log(reader, "ERROR: Not all required parameters are set!");
+-		reader->card_status = CARD_FAILURE;
++		rdr_log(reader,"Unknown Pairing type. Card will not work.");
++		return ERROR;
++	}
++	return OK;
++}
++
++static int32_t fastreinit(struct s_reader *reader)
++{
++	ATR newatr[ATR_MAX_SIZE];
++	memset(newatr, 0, 1);
++	if(ICC_Async_Activate(reader, newatr, 0))
++	{
+ 		return ERROR;
+ 	}
++	reader->cak7_seq = 0;
++	if(!CAK7_GetCamKey(reader))
++	{
++		return ERROR;
++	}
++	return OK;
++}
+ 
+-	reader->nprov = 1;
++static int32_t nagra3_card_init(struct s_reader *reader, ATR *newatr)
++{
++	get_atr;
++
++	memset(reader->hexserial, 0x00, 0x08);
++	reader->cak7_seq = 0;
++	reader->pairbyte = 0;
++	memset(reader->ecmheader,0x00,0x04);
++	cs_clear_entitlement(reader);
+ 
+-	//CAK7GetDataType(reader, 0x09);
++	if(memcmp(atr + 8, "DNASP4", 6) == 0)
++	{
++		if((memcmp(atr + 8, "DNASP400", 8) == 0) && !reader->cak7_mode)
++		{
++			return ERROR;
++		}
++		else
++		{
++			memcpy(reader->rom, atr + 8, 15);
++			rdr_log(reader,"Rom revision: %.15s", reader->rom);
++		}
++	}
++	else if(memcmp(atr + 11, "DNASP4", 6) == 0)
++	{
++		memcpy(reader->rom, atr + 11, 15);
++		rdr_log(reader,"Rom revision: %.15s", reader->rom);
++	}
++	else
++	{
++		return ERROR;
++	}
++
++	reader->nprov   = 1;
++	reader->nsa     = 0;
++	reader->nemm84  = 0;
++	reader->nemm83u = 0;
++	reader->nemm83s = 0;
++	reader->nemm87  = 0;
++
++	CAK7GetDataType(reader, 0x02);
+ 	CAK7GetDataType(reader, 0x05);
+-	CAK7_getCamKey(reader);
+-	//CAK7GetDataType(reader, 0x09);
+-	CAK7GetDataType(reader, 0x02); // sysid+caid
++	if(!CAK7_GetCamKey(reader))
++	{return ERROR;}
+ 
+ 	rdr_log(reader, "ready for requests");
+ 	return OK;
+@@ -540,28 +1347,85 @@
+ 	rdr_log_sensitive(reader, "SER:    {%s}", cs_hexdump(1, reader->hexserial + 2, 4, tmp, sizeof(tmp)));
+ 	rdr_log(reader, "CAID:   %04X", reader->caid);
+ 	rdr_log(reader, "Prv.ID: %s(sysid)", cs_hexdump(1, reader->prid[0], 4, tmp, sizeof(tmp)));
+-	CAK7GetDataType(reader, 0x03);
+ 	cs_clear_entitlement(reader); // reset the entitlements
+ 	rdr_log(reader, "-----------------------------------------");
+ 	rdr_log(reader, "|id  |tier    |valid from  |valid to    |");
+ 	rdr_log(reader, "+----+--------+------------+------------+");
++	CAK7GetDataType(reader, 0x03);
+ 	CAK7GetDataType(reader, 0x0C);
+ 	rdr_log(reader, "-----------------------------------------");
+-	uint8_t i;
++
++	CAK7GetDataType(reader, 0x04);
++	if(reader->forceemmg)
++	{
++		reader->emm82 = 1;
++	}
++
++	int i;
+ 	for(i = 1; i < reader->nprov; i++)
+ 	{
+ 		rdr_log(reader, "Prv.ID: %s", cs_hexdump(1, reader->prid[i], 4, tmp, sizeof(tmp)));
+ 	}
+ 
++	if(reader->cak7type != 3)
++	{
++		rdr_log(reader, "-----------------------------------------");
++		rdr_log(reader, "|       EMM Filters (PRIVATE!!)         |");
++		rdr_log(reader, "+---------------------------------------+");
++
++		if(reader->emm82 == 1)
++		{
++			rdr_log(reader, "|emm82                                  |");
++		}
++
++		char tmp7[48];
++
++		for(i = 0; i < reader->nemm84; i++)
++		{
++			rdr_log(reader, "|emm84 : %s                      |", cs_hexdump(1, reader->emm84[i], 3, tmp7, sizeof(tmp7)));
++		}
++
++		for(i = 0; i < reader->nemm83u; i++)
++		{
++			rdr_log(reader, "|emm83U: %s             |", cs_hexdump(1, reader->emm83u[i], 6, tmp7, sizeof(tmp7)));
++		}
++
++		for(i = 0; i < reader->nemm83s; i++)
++		{
++			rdr_log(reader, "|emm83S: %s             |", cs_hexdump(1, reader->emm83s[i], 6, tmp7, sizeof(tmp7)));
++		}
++
++		for(i = 0; i < reader->nemm87; i++)
++		{
++			rdr_log(reader, "|emm87 : %s             |", cs_hexdump(1, reader->emm87[i], 6, tmp7, sizeof(tmp7)));
++		}
++		rdr_log(reader, "-----------------------------------------");
++	}
++
+ 	return OK;
+ }
+ 
+ static void nagra3_post_process(struct s_reader *reader)
+ {
+-	if((reader->cak7_camstate & 64) == 64)
++	if(reader->cak7_seq >= 0x00FFF0)
+ 	{
+-		rdr_log(reader, "renew Session Key: CAK7");
+-		CAK7_getCamKey(reader);
++		rdr_log(reader, "Card needs reinit to prevent crash");
++		reader->card_status = CARD_NEED_INIT;
++		add_job(reader->client, ACTION_READER_RESTART, NULL, 0);
++	}
++	else if((reader->cak7_camstate & 64) == 64)
++	{
++		rdr_log(reader, "negotiating new Session Key");
++		if(!CAK7_GetCamKey(reader))
++		{
++			rdr_log(reader, "negotiations failed - trying FASTreinit");
++			if(!fastreinit(reader))
++			{
++				rdr_log(reader, "FASTreinit failed - need to restart reader");
++				reader->card_status = CARD_NEED_INIT;
++				add_job(reader->client, ACTION_READER_RESTART, NULL, 0);
++			}
++		}
+ 	}
+ }
+ 
+@@ -573,31 +1437,39 @@
+ 	memset(ecmreq,0xCC,0xC0);
+ 
+ 	ecmreq[ 7] = 0x05;
+-	ecmreq[ 8] = 0x8A;
+-	ecmreq[ 9] = 0x00;
+-	ecmreq[10] = 0x00;
+-	ecmreq[11] = 0x00;
+-	ecmreq[12] = 0x00;
+-	ecmreq[13] = 0x01;
+-	memcpy(&ecmreq[14], er->ecm + 4, er->ecm[4] + 1);
++	ecmreq[ 9] = 0x04;
++	ecmreq[10] = reader->ecmheader[0];
++	ecmreq[11] = reader->ecmheader[1];
++	ecmreq[12] = reader->ecmheader[2];
++	ecmreq[13] = reader->ecmheader[3];
++	if(reader->cak7type == 3)
++	{
++		ecmreq[8] = er->ecm[7] + 6;
++		memcpy(&ecmreq[14], er->ecm + 7, er->ecm[7] + 1);
++	}
++	else
++	{
++		ecmreq[8] = er->ecm[4] + 6;
++		memcpy(&ecmreq[14], er->ecm + 4, er->ecm[4] + 1);
++	}
+ 
+ 	do_cak7_cmd(reader, cta_res, &cta_lr, ecmreq, sizeof(ecmreq), 0xB0);
+ 
+-	if(cta_res[cta_lr - 2] != 0x90 && cta_res[cta_lr - 1] != 0x00)
++	rdr_log_dump_dbg(reader, D_READER, cta_res, 0xB0, "ECM Answer decrypted:");
++
++	if((cta_res[cta_lr - 2] != 0x90 && cta_res[cta_lr - 1] != 0x00) || cta_lr == 0)
+ 	{
+ 		rdr_log(reader, "(ECM) Reader will be restart now cause: %02X %02X card answer!!!", cta_res[cta_lr - 2], cta_res[cta_lr - 1]);
+ 		reader->card_status = CARD_NEED_INIT;
+ 		add_job(reader->client, ACTION_READER_RESTART, NULL, 0);
+ 	}
+-
+-	if(cta_res[27] == 0x5C)
++	else if(cta_res[27] != 0x00)
+ 	{
+ 		uint8_t _cwe0[8];
+ 		uint8_t _cwe1[8];
+ 
+-		if(cta_res[78] == 0x01)
++		if(cta_res[78] == 0x01 || reader->forcecwswap)
+ 		{
+-			rdr_log (reader,"Swap dcw is at use !");
+ 			memcpy(_cwe0,&cta_res[52], 0x08);
+ 			memcpy(_cwe1,&cta_res[28], 0x08);
+ 		}
+@@ -607,13 +1479,22 @@
+ 			memcpy(_cwe1,&cta_res[52], 0x08);
+ 		}
+ 
+-		if(!reader->cwekey_length)
++		if(cta_res[27] == 0x5C)
+ 		{
+-			rdr_log_dbg(reader, D_READER, "ERROR: CWPK is not set, can not decrypt CW");
+-			return ERROR;
++			if(!reader->cwekey0_length)
++			{
++				rdr_log(reader, "ERROR: CWPK is not set, can not decrypt CW");
++				return ERROR;
++			}
++
++			des_ecb3_decrypt(_cwe0, reader->cwekey0);
++			des_ecb3_decrypt(_cwe1, reader->cwekey0);
++		}
++		else if(cta_res[27] == 0x58)
++		{
++			des_ecb3_decrypt(_cwe0, reader->key3des);
++			des_ecb3_decrypt(_cwe1, reader->key3des);
+ 		}
+-		des_ecb3_decrypt(_cwe0, reader->cwekey);
+-		des_ecb3_decrypt(_cwe1, reader->cwekey);
+ 
+ 		int chkok = 1;
+ 		if(((_cwe0[0] + _cwe0[1] + _cwe0[2]) & 0xFF) != _cwe0[3])
+@@ -640,7 +1521,16 @@
+ 			rdr_log_dbg(reader, D_READER, "CW1 checksum error [1]");
+ 		}
+ 
++		memcpy(reader->ecmheader, cta_res + 9, 4);
++
+ 		reader->cak7_camstate = cta_res[4];
++
++		if(chkok == 0 && cta_res[27] == 0x5C)
++		{
++			rdr_log(reader, "CW checksum error - NUID-cwekey pair is wrong");
++			return ERROR;
++		}
++
+ 		if(chkok == 1)
+ 		{
+ 			rdr_log_dbg(reader, D_READER, "CW Decrypt ok");
+@@ -649,6 +1539,21 @@
+ 			return OK;
+ 		}
+ 	}
++	else
++	{
++		memcpy(reader->ecmheader, cta_res + 9, 4);
++
++		reader->cak7_camstate = cta_res[4];
++
++		if((reader->pairtype == 0x40 || reader->pairtype == 0x80) && reader->pairbyte == 0x40)
++		{
++			rdr_log(reader, "No CWs in card answer - reinit card in UNIQUE mode!");
++		}
++		else
++		{
++			rdr_log(reader, "card has no right to decode this channel");
++		}
++	}
+ 
+ 	return ERROR;
+ }
+@@ -656,24 +1561,75 @@
+ static int32_t nagra3_do_emm(struct s_reader *reader, EMM_PACKET *ep)
+ {
+ 	def_resp;
++
+ 	uint8_t emmreq[0xC0];
+ 	memset(emmreq, 0xCC, 0xC0);
++
+ 	emmreq[ 7] = 0x05;
+-	emmreq[ 8] = 0x8A;
+-	emmreq[ 9] = 0x00;
+-	emmreq[10] = 0x00;
+-	emmreq[11] = 0x00;
+-	emmreq[12] = 0x00;
+-	emmreq[13] = 0x01;
+-	memcpy(&emmreq[14], ep->emm + 9, ep->emm[9] + 1);
++	emmreq[ 9] = 0x04;
++	emmreq[10] = reader->ecmheader[0];
++	emmreq[11] = reader->ecmheader[1];
++	emmreq[12] = reader->ecmheader[2];
++	emmreq[13] = reader->ecmheader[3];
++
++	if(reader->cak7type == 3)
++	{
++		int32_t i;
++		uint8_t *prov_id_ptr;
++
++		switch(ep->type)
++		{
++			case SHARED:
++				emmreq[8] = ep->emm[9] + 6;
++				prov_id_ptr = ep->emm + 3;
++				memcpy(&emmreq[14], ep->emm + 9, ep->emm[9] + 1);
++				break;
++
++			case UNIQUE:
++				emmreq[8] = ep->emm[12] + 6;
++				prov_id_ptr = ep->emm + 9;
++				memcpy(&emmreq[14], ep->emm + 12, ep->emm[12] + 1);
++				break;
++
++			case GLOBAL:
++				emmreq[8] = ep->emm[6] + 6;
++				prov_id_ptr = ep->emm + 3;
++				memcpy(&emmreq[14], ep->emm + 6, ep->emm[6] + 1);
++				break;
++
++			default:
++				rdr_log(reader, "EMM: Congratulations, you have discovered a new EMM on Merlin.");
++				rdr_log(reader, "This has not been decoded yet.");
++				return ERROR;
++		}
++
++		i = get_prov_index(reader, prov_id_ptr);
++		if(i == -1)
++		{
++			rdr_log(reader, "EMM: skipped since provider id doesnt match");
++			return SKIPPED;
++		}
++	}
++	else
++	{
++		emmreq[8] = ep->emm[9] + 6;
++		memcpy(&emmreq[14], ep->emm + 9, ep->emm[9] + 1);
++	}
++
+ 	do_cak7_cmd(reader, cta_res, &cta_lr, emmreq, sizeof(emmreq), 0xB0);
+ 
+-	if(cta_res[cta_lr-2] != 0x90 && cta_res[cta_lr-1] != 0x00)
++	if((cta_res[cta_lr-2] != 0x90 && cta_res[cta_lr-1] != 0x00) || cta_lr == 0)
+ 	{
+ 		rdr_log(reader, "(EMM) Reader will be restart now cause: %02X %02X card answer!!!", cta_res[cta_lr - 2], cta_res[cta_lr - 1]);
+ 		reader->card_status = CARD_NEED_INIT;
+ 		add_job(reader->client, ACTION_READER_RESTART, NULL, 0);
+ 	}
++	else
++	{
++		memcpy(reader->ecmheader, cta_res + 9, 4);
++
++		reader->cak7_camstate = cta_res[4];
++	}
+ 	return OK;
+ }
+
+Index: webif/pages_index.txt
+--- webif/pages_index.txt	2019-11-09 21:23:00.045455943 +0100
++++ webif/pages_index.txt	2019-11-09 20:46:21.651589515 +0100
+@@ -199,6 +199,7 @@
+ READERCONFIGIRDETO            readerconfig/readerconfig_hwreader_irdeto.html              READER_IRDETO
+ READERCONFIGNAGRA             readerconfig/readerconfig_hwreader_nagra.html               READER_NAGRA
+ READERCONFIGNAGRACAK7         readerconfig/readerconfig_hwreader_nagracak7.html           READER_NAGRA_MERLIN
++READERCONFIGCONAX             readerconfig/readerconfig_hwreader_conax.html               READER_CONAX
+ READERCONFIGNANO              readerconfig/readerconfig_hwreader_nano.html                WITH_CARDREADER
+ READERPINCODE                 readerconfig/readerconfig_hwreader_pincode.html             READER_CONAX,READER_CRYPTOWORKS,READER_VIACCESS,READER_SECA
+ READERCONFIGRSAKEY            readerconfig/readerconfig_hwreader_rsakey.html              READER_NAGRA,READER_IRDETO,READER_CONAX
+Index: webif/readerconfig/readerconfig_cccambit.html
+--- webif/readerconfig/readerconfig_cccambit.html	2019-11-09 21:22:59.881457018 +0100
++++ webif/readerconfig/readerconfig_cccambit.html	2019-11-09 20:46:21.575590031 +0100
+@@ -1,3 +1,12 @@
++			<TR><TD><A>AU NAGRA type:</A></TD>
++					<TD>
++						<select name="autype">
++							<option value="0" ##AUTYPE0##>0 - Standard</option>
++							<option value="1" ##AUTYPE1##>1 - For Seca/Nagra cards</option>
++							<option value="2" ##AUTYPE2##>2 - For CAK7 cards</option>
++						</select>
++					</TD>
++			</TR>
+ 			<TR><TD><A>Inactivity timeout:</A></TD><TD><input name="inactivitytimeout" class="withunit short" type="text" maxlength="10" value="##INACTIVITYTIMEOUT##"> s</TD></TR>
+ 			<TR><TD><A>Reconnect timeout:</A></TD><TD><input name="reconnecttimeout" class="withunit short" type="text" maxlength="10" value="##RECEIVETIMEOUT##"> s</TD></TR>
+ 			<TR><TD><A>Request timeout:</A></TD><TD><input name="cccreconnect" class="withunit short" type="text" maxlength="10" value="##CCCRECONNECT##"> ms</TD></TR>
+Index: webif/readerconfig/readerconfig_hwreader_conax.html
+--- webif/readerconfig/readerconfig_hwreader_conax.html	1970-01-01 01:00:00.000000000 +0100
++++ webif/readerconfig/readerconfig_hwreader_conax.html	2019-11-09 21:01:21.369905256 +0100
+@@ -0,0 +1,2 @@
++<TR><TH COLSPAN="2">Reader specific settings for Conax</TH></TR>
++<TR><TD><A>CWPK:</A></TD><TD><input name="cwpkkey" class="longer" type="text" maxlength="32" value="##CWPKKEY##"></TD></TR>
+Index: webif/readerconfig/readerconfig_hwreader.html
+--- webif/readerconfig/readerconfig_hwreader.html	2019-11-09 21:22:59.881457018 +0100
++++ webif/readerconfig/readerconfig_hwreader.html	2019-11-09 20:46:21.575590031 +0100
+@@ -17,10 +17,12 @@
+ ##TPLREADERPINCODE##
+ ##TPLREADERCONFIGNANO##
+ 				<TR><TD><A>Reset after No. ECM:</A></TD><TD><input name="resetcycle" class="short" type="text" maxlength="5" value="##RESETCYCLE##"></TD></TR>
++				<TR><TD><A>Write Delay:</A></TD><TD><input name="wdelay" class="short" type="text" maxlength="5" value="##WDELAY##"></TD></TR>
+ 				<TR><TD><A>Deprecated:</A></TD><TD><input name="deprecated" type="hidden" value="0"><input name="deprecated" type="checkbox" value="1" ##DEPRECATEDCHECKED##><label></label></TD></TR>
+ ##TPLREADERCONFIGCRYPTOWORKS##
+ ##TPLREADERCONFIGNAGRA##
+ ##TPLREADERCONFIGNAGRACAK7##
++##TPLREADERCONFIGCONAX##
+ ##TPLREADERCONFIGIRDETO##
+ ##TPLREADERCONFIGVIACCESS##
+ ##TPLREADERCONFIGDRE##
+Index: webif/readerconfig/readerconfig_hwreader_nagracak7.html
+--- webif/readerconfig/readerconfig_hwreader_nagracak7.html	2019-11-09 21:22:59.837457306 +0100
++++ webif/readerconfig/readerconfig_hwreader_nagracak7.html	2019-11-09 20:46:21.583589977 +0100
+@@ -1,8 +1,24 @@
+ 			<TR><TH COLSPAN="2">Reader specific settings for Nagra Merlin</TH></TR>
++				<TR><TD><A>Init card in CAK7 mode:</A></TD><TD><input name="cak7_mode" type="hidden" value="0"><input name="cak7_mode" type="checkbox" value="1" ##NAGRACAK7MODECHECKED##><label></label></TD></TR>
++				<TR><TD><A>Force CW swap:</A></TD><TD><input name="forcecwswap" type="hidden" value="0"><input name="forcecwswap" type="checkbox" value="1" ##FORCECWSWAPCHECKED##><label></label></TD></TR>
++				<TR><TD><A>Force Even SA:</A></TD><TD><input name="evensa" type="hidden" value="0"><input name="evensa" type="checkbox" value="1" ##EVENSACHECKED##><label></label></TD></TR>
++				<TR><TD><A>Force EMMs 0x82:</A></TD><TD><input name="forceemmg" type="hidden" value="0"><input name="forceemmg" type="checkbox" value="1" ##FORCEEMMGCHECKED##><label></label></TD></TR>
+ 				<TR><TD><A>mod1:</A></TD><TD><textarea name="mod1" rows="4" class="bt" maxlength="224">##MOD1##</textarea></TD></TR>
++				<TR><TD><A>mod2:</A></TD><TD><textarea name="mod2" rows="4" class="bt" maxlength="224">##MOD2##</textarea></TD></TR>
++				<TR><TD><A>key3588:</A></TD><TD><textarea name="key3588" rows="5" class="bt" maxlength="272">##KEY3588##</textarea></TD></TR>
++				<TR><TD><A>key3460:</A></TD><TD><textarea name="key3460" rows="4" class="bt" maxlength="192">##KEY3460##</textarea></TD></TR>
++				<TR><TD><A>key3310:</A></TD><TD><textarea name="key3310" rows="4" class="bt" maxlength="32">##KEY3310##</textarea></TD></TR>
+ 				<TR><TD><A>data50:</A></TD><TD><textarea name="data50" rows="2" class="bt" maxlength="160">##DATA50##</textarea></TD></TR>
+ 				<TR><TD><A>mod50:</A></TD><TD><textarea name="mod50" rows="2" class="bt" maxlength="160">##MOD50##</textarea></TD></TR>
+-				<TR><TD><A>key60:</A></TD><TD><textarea name="key60" rows="3" class="bt" maxlength="192">##KEY60##</textarea></TD></TR>
+-				<TR><TD><A>exp60:</A></TD><TD><textarea name="exp60" rows="3" class="bt" maxlength="192">##EXP60##</textarea></TD></TR>
++				<TR><TD><A>Idird:</A></TD><TD><input name="idird" class="medium" type="text" maxlength="8" value="##IDIRD##"></TD></TR>
++				<TR><TD><A>CMD0E ProvID:</A></TD><TD><input name="cmd0eprov" class="medium" type="text" maxlength="4" value="##CMD0EPROV##"> use only if CMD0E needs ProvID other than sysid</TD></TR>
+ 				<TR><TD><A>Nuid:</A></TD><TD><input name="nuid" class="medium" type="text" maxlength="8" value="##NUID##"></TD></TR>
+-				<TR><TD><A>CWPK:</A></TD><TD><input name="cwekey" class="longer" type="text" maxlength="32" value="##CWEKEY##"></TD></TR>
++				<TR><TD><A>CWPK0:</A></TD><TD><input name="cwekey0" class="longer" type="text" maxlength="32" value="##CWEKEY0##"></TD></TR>
++				<TR><TD><A>CWPK1:</A></TD><TD><input name="cwekey1" class="longer" type="text" maxlength="32" value="##CWEKEY1##"></TD></TR>
++				<TR><TD><A>CWPK2:</A></TD><TD><input name="cwekey2" class="longer" type="text" maxlength="32" value="##CWEKEY2##"></TD></TR>
++				<TR><TD><A>CWPK3:</A></TD><TD><input name="cwekey3" class="longer" type="text" maxlength="32" value="##CWEKEY3##"></TD></TR>
++				<TR><TD><A>CWPK4:</A></TD><TD><input name="cwekey4" class="longer" type="text" maxlength="32" value="##CWEKEY4##"></TD></TR>
++				<TR><TD><A>CWPK5:</A></TD><TD><input name="cwekey5" class="longer" type="text" maxlength="32" value="##CWEKEY5##"></TD></TR>
++				<TR><TD><A>CWPK6:</A></TD><TD><input name="cwekey6" class="longer" type="text" maxlength="32" value="##CWEKEY6##"></TD></TR>
++				<TR><TD><A>CWPK7:</A></TD><TD><input name="cwekey7" class="longer" type="text" maxlength="32" value="##CWEKEY7##"></TD></TR>
++
+Index: webif/readerconfig/readerconfig_ncd524bit.html
+--- webif/readerconfig/readerconfig_ncd524bit.html	2019-11-09 21:22:59.837457306 +0100
++++ webif/readerconfig/readerconfig_ncd524bit.html	2019-11-09 20:46:21.555590166 +0100
+@@ -1,3 +1,12 @@
++			<TR><TD><A>AU NAGRA type:</A></TD>
++					<TD>
++						<select name="autype">
++							<option value="0" ##AUTYPE0##>0 - Standard</option>
++							<option value="1" ##AUTYPE1##>1 - For Seca/Nagra cards</option>
++							<option value="2" ##AUTYPE2##>2 - For CAK7 cards</option>
++						</select>
++					</TD>
++			</TR>
+ 			<TR><TD><A>User:</A></TD><TD><input name="user" class="longer" type="text" maxlength="50" value="##USERNAME##"></TD></TR>
+ 			<TR><TD><A>Password:</A></TD><TD><input name="password" class="longer" type="text" maxlength="50" value="##PASSWORD##"></TD></TR>
+ 			<TR><TD><A>Key:</A></TD><TD><input name="key" class="longer" type="text" maxlength="28" value="##NCD_KEY##"></TD></TR>
+Index: webif/readerconfig/readerconfig_ncd525bit.html
+--- webif/readerconfig/readerconfig_ncd525bit.html	2019-11-09 21:22:59.837457306 +0100
++++ webif/readerconfig/readerconfig_ncd525bit.html	2019-11-09 20:46:21.555590166 +0100
+@@ -1,3 +1,12 @@
++			<TR><TD><A>AU NAGRA type:</A></TD>
++					<TD>
++						<select name="autype">
++							<option value="0" ##AUTYPE0##>0 - Standard</option>
++							<option value="1" ##AUTYPE1##>1 - For Seca/Nagra cards</option>
++							<option value="2" ##AUTYPE2##>2 - For CAK7 cards</option>
++						</select>
++					</TD>
++			</TR>
+ 			<TR><TD><A>User:</A></TD><TD><input name="user" class="longer" type="text" maxlength="50" value="##USERNAME##"></TD></TR>
+ 			<TR><TD><A>Password:</A></TD><TD><input name="password" class="longer" type="text" maxlength="50" value="##PASSWORD##"></TD></TR>
+ 			<TR><TD><A>Key:</A></TD><TD><input name="key" class="longer" type="text" maxlength="28" value="##NCD_KEY##"></TD></TR>
