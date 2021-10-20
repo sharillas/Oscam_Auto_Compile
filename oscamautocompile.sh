@@ -9,7 +9,7 @@ apt install -y zlib1g zlibc dialog build-essential mercurial minizip
 apt install -y libsystemd-dev libudev-dev
 
 # Install PCSC Support
-wget https://pcsclite.apdu.fr/files/pcsc-lite-1.9.0.tar.bz2
+wget https://github.com/sharillas/Oscam_Auto_Compile/raw/main/pcsc-lite-1.9.0.tar.bz2
 tar -xf pcsc-lite-1.9.0.tar.bz2
 cd pcsc-lite-1.9.0
 ./configure
