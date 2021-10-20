@@ -17,7 +17,7 @@ make
 sudo make install
 
 # Install LIBUSB Support
-wget https://github.com/libusb/libusb/releases/download/v1.0.23/libusb-1.0.23.tar.bz2
+wget https://github.com/sharillas/Oscam_Auto_Compile/raw/main/libusb-1.0.23.tar.bz2
 tar -xf libusb-1.0.23.tar.bz2
 cd libusb-1.0.23
 ./configure
