@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # sharillas-script-Auto-Build
 sudo -i
 apt update
