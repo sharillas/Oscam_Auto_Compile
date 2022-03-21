@@ -8,21 +8,6 @@ apt install -y libpcsclite1 libpcsclite-dev libusb-dev libssl-dev libpnglite-dev
 apt install -y zlib1g zlibc dialog build-essential mercurial minizip
 apt install -y libsystemd-dev libudev-dev
 
-# Install PCSC Support
-wget https://github.com/sharillas/Oscam_Auto_Compile/raw/main/pcsc-lite-1.9.0.tar.bz2
-tar -xf pcsc-lite-1.9.0.tar.bz2
-cd pcsc-lite-1.9.0
-./configure
-make
-sudo make install
-
-# Install LIBUSB Support
-wget https://github.com/sharillas/Oscam_Auto_Compile/raw/main/libusb-1.0.23.tar.bz2
-tar -xf libusb-1.0.23.tar.bz2
-cd libusb-1.0.23
-./configure
-make
-sudo make install
 
 # Download and Cross-Compile Oscam last build from SVN Streamboard
 svn checkout https://svn.streamboard.tv/oscam/trunk oscam-svn
