@@ -1,5 +1,5 @@
-# Build your own Oscam (Ubuntu & Debian)
-
+#!/bin/bash
+# sharillas-script-Auto-Build
 sudo -i
 apt update
 apt install cvs subversion autoconf libccid automake libtool gettext make cmake tar 
